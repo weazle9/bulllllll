@@ -44,25 +44,36 @@ def select_mixed_commercials(duration, types):
     current_time = datetime.datetime.now()
     mixed_commercials = []
 
-    # Select commercials from each type up to half the duration
+    # ✅ Select commercials from each type, respecting duration limit
+    # Pass duration so select_commercials filters by it
     for type in types:
-        commercials_of_type = select_commercials(type, duration // 2, [type])
+        commercials_of_type = select_commercials(type, duration, [type])
         mixed_commercials.extend(commercials_of_type)
 
     # Shuffle to mix them up
     random.shuffle(mixed_commercials)
 
-    # Now trim if we selected too much
-    total_duration = sum(c['Duration'] for c in mixed_commercials if 'Duration' in c)
+    # ✅ Now trim if we selected too much (should rarely happen now)
+    total_duration = sum(get_duration_by_path(p) for p in mixed_commercials)
     while total_duration > duration and mixed_commercials:
         mixed_commercials.pop()
-        total_duration = sum(c['Duration'] for c in mixed_commercials if 'Duration' in c)
+        total_duration = sum(get_duration_by_path(p) for p in mixed_commercials)
 
     return mixed_commercials
 
+
 def select_commercials(channel, duration, types, fixed_number=1, played_commercials=set(), first_only=False):
     selected_commercials = []
-    eligible_commercials = [c for c in commercials if c['Type'] in types and c['Channel/Block'] == channel]
+
+    # ✅ FILTER by duration BEFORE selecting
+    if duration and duration > 0:
+        eligible_commercials = [c for c in commercials
+                                if c['Type'] in types
+                                and c['Channel/Block'] == channel
+                                and c.get('Duration', 0) <= duration]
+    else:
+        # No duration limit
+        eligible_commercials = [c for c in commercials if c['Type'] in types and c['Channel/Block'] == channel]
 
     if not eligible_commercials:
         return []  # nothing to choose from → prevent crash
@@ -164,21 +175,14 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # === YOUR EXISTING PICK LOGIC (unchanged) ===
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 5):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 elif pick_one in range(6, 7):  # only 6
-                    candidate = select_commercials('Powerhouse', None,
+                    candidate = select_commercials('Powerhouse', remaining_now,
                                                    [random.choice(['Special', 'Groove', 'shorties'])],
                                                    fixed_number=1)
                 else:
-                    candidate = select_commercials('Powerhouse', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Powerhouse', remaining_now, ['Promo'], fixed_number=1)
                 # === end pick logic ===
-
-                # Fallback only if we still don't have a candidate at certain attempt counts
-                if not candidate and attempts in (10, 20, 30):
-                    try:
-                        candidate = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        candidate = None
 
                 if not candidate:
                     continue
@@ -314,25 +318,16 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 6):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 elif pick_one in range(7, 8):
-                    candidate = select_commercials('Powerhouse', None,
+                    candidate = select_commercials('Powerhouse', remaining_now,
                                                    [random.choice(['Special', 'Groove', 'shorties'])],
                                                    fixed_number=1)
                 else:
-                    candidate = select_commercials('Cartoon Network', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Cartoon Network', remaining_now, ['Promo'], fixed_number=1)
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -466,29 +461,21 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 6):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 elif pick_one in range(9, 9):
-                    candidate = select_commercials('Powerhouse', None,
+                    candidate = select_commercials('Powerhouse', remaining_now,
                                                    [random.choice(['Special', 'Groove'])],
                                                    fixed_number=1)
                 elif pick_one in range(7, 7):
-                    candidate = select_commercials('Cartoon Network', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Cartoon Network', remaining_now, ['Promo'], fixed_number=1)
                 elif pick_one in range(8, 8):
-                    candidate = select_commercials('Toonami', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Toonami', remaining_now, ['Promo'], fixed_number=1)
                 else:
-                    candidate = select_commercials('Powerhouse', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Powerhouse', remaining_now, ['Promo'], fixed_number=1)
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
+
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -556,7 +543,7 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
             if current_show != next_show:
                 toonami_credit = select_commercials('Toonami Credit', None, [current_show], fixed_number=1)
                 if toonami_credit:
-                    return_bump.extend(toonami_credit)
+                    return_bump_to_add.extend(toonami_credit)
             # --- Return bump (ALWAYS FIRST) ---
             if current_show == next_show:
                 return_bump = select_commercials('Toonami Return', None, [current_show], fixed_number=1)
@@ -609,30 +596,30 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 if remaining_now <= 0:
                     break
 
-                # Try a small filler piece
+                # Try a small filler piece - ✅ PASS remaining_now to filter by duration
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 4):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 elif pick_one in range(5, 8):
-                    candidate = select_commercials('Toonami', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Toonami', remaining_now, ['Promo'], fixed_number=1)
                 else:
-                    candidate = select_commercials("Cartoon Network", None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials("Cartoon Network", remaining_now, ['Promo'], fixed_number=1)
 
                 if not candidate:
-                    pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
+                    continue  # ✅ Skip to next iteration instead of pass
+
+                # Fallback: after many tries, attempt a generic short pool once
                 if attempts in (10, 20, 30):
                     try:
-                        fallback = select_mixed_commercials(999, ['General'])
+                        fallback = select_mixed_commercials(remaining_now, ['General'])
                     except Exception:
                         fallback = None
                     if fallback:
                         candidate = fallback
-                    continue
+                    else:
+                        continue  # ✅ Skip if no fallback found
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
-                if candidate_duration > remaining_now:
-                    continue
                 if candidate_duration > remaining_now:
                     continue
                 projected_total = (
@@ -770,27 +757,16 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 4):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 elif pick_one in range(5, 8):
-                    candidate = select_commercials('Toonami', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Toonami', remaining_now, ['Promo'], fixed_number=1)
                 else:
-                    candidate = select_commercials("Cartoon Network", None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials("Cartoon Network", remaining_now, ['Promo'], fixed_number=1)
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
-                if candidate_duration > remaining_now:
-                    continue
                 if candidate_duration > remaining_now:
                     continue
                 projected_total = (
@@ -927,24 +903,16 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
 
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
-                if pick_one in range(1, 8):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
-                elif pick_one in range(9, 9):
-                    candidate = select_commercials('Miguzi', None, ['promo'], fixed_number=1)
+                if pick_one in range(1, 7):
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
+                elif pick_one in range(8, 9):
+                    candidate = select_commercials('Miguzi', remaining_now, ['promo'], fixed_number=1)
                 else:
-                    candidate = select_commercials("Cartoon Network", None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials("Cartoon Network", remaining_now, ['Promo'], fixed_number=1)
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
+
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -1096,9 +1064,9 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 4):
-                    candidate = select_mixed_commercials(999, ['Not Kids', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'Games', 'General'])
                 elif pick_one in range(6, 10):
-                    candidate = select_commercials('Adult Swim', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Adult Swim', remaining_now, ['Promo'], fixed_number=1)
                 else:
                     if type_limit_tracker['Text'] < MAX_PER_TYPE['Text']:
                         candidate = select_commercials('Adult Swim', None, ['Text'], fixed_number=1)
@@ -1109,15 +1077,6 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -1248,25 +1207,17 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 4):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 elif pick_one in range(5, 6):
-                    candidate = select_commercials('Toonami', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Toonami', remaining_now, ['Promo'], fixed_number=1)
                 elif pick_one in range(7, 8):
-                    candidate = select_commercials('SVES', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('SVES', remaining_now, ['Promo'], fixed_number=1)
                 else:
-                    candidate = select_commercials("Cartoon Network", None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials("Cartoon Network", remaining_now, ['Promo'], fixed_number=1)
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
+
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -1384,50 +1335,44 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
             filler_total_duration = 0
             max_attempts = 70
             attempts = 0
+            used_commercials = set()  # ✅ Track used commercials to prevent duplicates
 
             while attempts < max_attempts:
-                # Recalc time left; do NOT early-stop here for slack
-                remaining_now = (
-                    break_duration
-                    - sum(get_duration_by_path(p) for p in return_bump_to_add)
-                    - sum(get_duration_by_path(p) for p in commercials_to_add)
-                    - filler_total_duration
-                    - sum(get_duration_by_path(p) for p in back_bump_to_add)
-                )
-                if remaining_now <= 0:
-                    break
-                # NOTE: no STOP_SLACK_SECONDS check here; we only stop after a successful append
-                remaining_now = (
-                    break_duration
-                    - sum(get_duration_by_path(p) for p in return_bump_to_add)
-                    - sum(get_duration_by_path(p) for p in commercials_to_add)
-                    - filler_total_duration
-                    - sum(get_duration_by_path(p) for p in back_bump_to_add)
-                )
-                if remaining_now <= 0:
-                    break
-                    break
                 attempts += 1
-                candidate = select_mixed_commercials(999, ['PEts', 'Sports', 'showstuff', 'Movie goers',
-                'Mikes', 'learning', 'express', '411', 'promos'])
+
+                # Calculate time left to fill
+                remaining_now = (
+                        break_duration
+                        - sum(get_duration_by_path(p) for p in return_bump_to_add)
+                        - sum(get_duration_by_path(p) for p in commercials_to_add)
+                        - filler_total_duration
+                        - sum(get_duration_by_path(p) for p in back_bump_to_add)
+                )
+                if remaining_now <= 0:
+                    break
+
+                # ✅ Use Playhouse Disney's own commercial pools with duration filter
+                candidate = select_commercials('Play House Disney', remaining_now, ['Promo'], fixed_number=1)
+
+
+                # Last resort: try a Playhouse Disney bump
+                if not candidate:
+                    candidate = select_commercials('Play House Disney', remaining_now, ['Bump'], fixed_number=1)
 
                 if not candidate:
-                    pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
                     continue
 
+                # ✅ Check for duplicates
+                candidate_paths = set(candidate)
+                if candidate_paths & used_commercials:
+                    continue  # Skip if already used
+
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
+
+                # ✅ Hard check: never exceed remaining time
                 if candidate_duration > remaining_now:
                     continue
-                if candidate_duration > remaining_now:
-                    continue
+
                 projected_total = (
                         sum(get_duration_by_path(p) for p in return_bump_to_add)
                         + sum(get_duration_by_path(p) for p in commercials_to_add)
@@ -1436,17 +1381,14 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                         + sum(get_duration_by_path(p) for p in back_bump_to_add)
                 )
 
-                if projected_total <= break_duration + 90:
+
+                # ✅ NEVER overfill - accept underfill instead
+                if projected_total <= break_duration:
                     filler_ads.extend(candidate)
                     filler_total_duration += candidate_duration
                     slack = break_duration - projected_total
                     if 0 <= slack <= STOP_SLACK_SECONDS:
-                        break
-
-                    if projected_total >= break_duration:
-                        break  # close enough
-                else:
-                    continue  # too long, try something smaller
+                        break  # Close enough, stop filling
 
             # Add best attempt filler
             commercials_to_add.extend(filler_ads)
@@ -1518,6 +1460,8 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
             max_attempts = 70
             attempts = 0
 
+            failed_mixed_attempts = 0  # ✅ Track failed attempts with mixed commercials
+
             while attempts < max_attempts:
                 attempts += 1
 
@@ -1532,23 +1476,22 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 if remaining_now <= 0:
                     break
 
-                # 1) Your primary pool pick (unchanged – adjust names to your real pools)
-                candidate = select_mixed_commercials(999, [
-                    'Pets', 'Sports', 'Songs', 'showstuff', 'Movie goers',
-                    'Mikes', 'learning', 'express', '411'
-                ])
+                # 1) Try mixed pools first, but only if we haven't failed too many times
+                if failed_mixed_attempts < 10:
+                    candidate = select_mixed_commercials(remaining_now, [
+                        'Pets', 'Sports', 'Songs', 'showstuff', 'Movie goers',
+                        'Mikes', 'learning', 'express', '411'
+                    ])
+                else:
+                    candidate = []  # ✅ Force fallback to promos after 10 failed attempts
 
-                # 2) Immediate fallback cascade in the SAME iteration (never skip it)
+
                 if not candidate:
-                    # try a general Disney pool
-                    candidate = select_mixed_commercials(999, ['General']) or candidate
-                if not candidate:
-                    # allow promos as lightweight filler
+                    # allow promos as lightweight filler FIRST
                     candidate = select_commercials('Disney', None, ['promos'], fixed_number=1) or candidate
                 if not candidate:
                     # last resort: one bump (if you allow it)
                     candidate = select_commercials('Disney', None, ['bump'], fixed_number=1) or candidate
-
                 if not candidate:
                     continue  # nothing this round, try again
 
@@ -1556,6 +1499,7 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
 
                 # Hard guard: never pick longer than what's left
                 if candidate_duration > remaining_now:
+                    failed_mixed_attempts += 1  # ✅ Increment failed counter
                     continue
 
                 projected_total = (
@@ -1668,18 +1612,12 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                     break
 
                 # === YOUR PICK LOGIC (unchanged) ===
-                candidate = select_mixed_commercials(999, [
+                candidate = select_mixed_commercials(remaining_now, [
                     'Pets', 'Sports', 'Songs', 'showstuff', 'Movie goers',
                     'Mikes', 'learning', 'express', '411'
                 ])
                 # === end pick logic ===
 
-                # Fallback only if we still don't have a candidate at certain attempts
-                if not candidate and attempts in (10, 20, 30):
-                    try:
-                        candidate = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        candidate = None
 
                 if not candidate:
                     continue
@@ -1790,22 +1728,15 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
                 if pick_one == 6:
-                    candidate = select_mixed_commercials(999, ['Pets', 'Sports', 'Songs', 'showstuff', 'Movie goers',
+                    candidate = select_mixed_commercials(remaining_now, ['Pets', 'Sports', 'Songs', 'showstuff', 'Movie goers',
                     'Mikes', 'learning', 'express', '411'])
                 else:
-                    candidate = select_commercials('Toon Disney', None, ['promo'], fixed_number=1)
+                    candidate = select_commercials('Toon Disney', remaining_now, ['promo'], fixed_number=1)
 
                 if not candidate:
                     pass
                 # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
+
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -1820,7 +1751,8 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                         + sum(get_duration_by_path(p) for p in back_bump_to_add)
                 )
 
-                if projected_total <= break_duration + 70:
+                # ✅ NEVER overfill - accept underfill instead
+                if projected_total <= break_duration:
                     filler_ads.extend(candidate)
                     filler_total_duration += candidate_duration
                     slack = break_duration - projected_total
@@ -1941,21 +1873,12 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 2)
                 if pick_one == 1:
-                    candidate = select_mixed_commercials(999, ['Toys'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys'])
                 else:
-                    candidate = select_commercials("Nick", None, ['promo'], fixed_number=1)
+                    candidate = select_commercials("Nick", remaining_now, ['promo'], fixed_number=1)
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -2047,6 +1970,8 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
             filler_total_duration = 0
             max_attempts = 100
             attempts = 0
+            max_bumps = 2
+            bumps = 0
 
             while attempts < max_attempts:
                 attempts += 1
@@ -2064,17 +1989,20 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 4):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 elif pick_one in range(5, 6):
-                    candidate = select_commercials('Nick', None, ['coms'], fixed_number=1)
+                    candidate = select_commercials('Nick', remaining_now, ['coms'], fixed_number=1)
                 elif pick_one in range(7, 9):
-                    candidate = select_commercials('Nick', None, ['promo'], fixed_number=1)
+                    candidate = select_commercials('Nick', remaining_now, ['promo'], fixed_number=1)
                 else:
-                    candidate = select_commercials("Nick", None, ['bump'], fixed_number=1)
+                    if max_bumps > bumps:
+                        candidate = select_commercials("Nick", remaining_now, ['bump'], fixed_number=1)
+                        bumps += 1
+                    else:
+                        continue
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
-                if candidate_duration > remaining_now:
-                    continue
+
                 if candidate_duration > remaining_now:
                     continue
                 projected_total = (
@@ -2163,11 +2091,11 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                     break
 
                 # Try a small filler piece
-                pick_one = range(1, 7)
+                pick_one = random.randint(1, 7)
                 if pick_one == 3:
-                    candidate = select_commercials("Nick at nite", None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials("Nick at nite", remaining_now, ['Promo'], fixed_number=1)
                 else:
-                    candidate = select_mixed_commercials(999, ['Not Kids', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not kids', 'General'])
                 if not candidate:
                     pass
 
@@ -2283,21 +2211,13 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 7):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 else:
-                    candidate = select_commercials('FoxBox', None, ['promo'], fixed_number=1)
+                    candidate = select_commercials('FoxBox', remaining_now, ['promo'], fixed_number=1)
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
+
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -2357,12 +2277,12 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
             current_duration = return_bump_duration + middle_duration + back_bump_duration
             filler_needed = break_duration - current_duration
 
-            # --- Fill remaining time with filler (smart, iterative fitting) ---
             # --- Fill remaining time with filler (smart, iterative fitting, no overshoot) ---
             filler_ads = []
             filler_total_duration = 0
             max_attempts = 70
             attempts = 0
+            failed_mixed_attempts = 0  # ✅ Track failed attempts with mixed commercials
 
             while attempts < max_attempts:
                 attempts += 1
@@ -2378,13 +2298,16 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 if remaining_now <= 0:
                     break
 
-                pick_one = range(1, 10)
+                pick_one = random.randint(1, 10)
                 if pick_one == 3:
-                    candidate = select_commercials("Fox", None, ['promo'], fixed_number=1)
+                    candidate = select_commercials("Fox", remaining_now, ['promo'], fixed_number=1)
                 elif pick_one == 5:
-                    candidate = select_mixed_commercials(999, ['Games'])
+                    candidate = select_mixed_commercials(remaining_now, ['Games'])
                 else:
-                    candidate = select_mixed_commercials(999, ['Not Kids', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'General'])
+
+                if not candidate:
+                    continue  # nothing this round, try again
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
 
@@ -2539,9 +2462,9 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # === YOUR EXISTING PICK LOGIC (unchanged) ===
                 pick_one = random.randint(1, 10)
                 if pick_one in range(1, 4):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 elif pick_one in range(5, 9):
-                    candidate = select_commercials('Kids WB', None, ['Promo'], fixed_number=1)
+                    candidate = select_commercials('Kids WB', remaining_now, ['Promo'], fixed_number=1)
                 else:
                     if type_limit_tracker['Bump'] < MAX_PER_TYPE['Bump']:
                         candidate = select_commercials('Kids WB', None, ['Bump'], fixed_number=1)
@@ -2553,15 +2476,6 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
 
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -2654,9 +2568,9 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 7)
                 if pick_one == 3:
-                    candidate = select_commercials("WB", None, ['promos'], fixed_number=1)
+                    candidate = select_commercials("WB", remaining_now, ['promos'], fixed_number=1)
                 else:
-                    candidate = select_mixed_commercials(999, ['Not Kids', 'Games', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'Games', 'General'])
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
 
@@ -2737,9 +2651,9 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 7)
                 if pick_one == 3:
-                    candidate = select_commercials("WB", None, ['promos'], fixed_number=1)
+                    candidate = select_commercials("WB", remaining_now, ['promos'], fixed_number=1)
                 else:
-                    candidate = select_mixed_commercials(999, [ 'Games', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, [ 'Games', 'General'])
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
 
@@ -2818,11 +2732,11 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                     break
 
                 # Try a small filler piece
-                pick_one = range(1, 7)
+                pick_one = random.randint(1, 7)
                 if pick_one in range(2,4):
-                    candidate = select_commercials("ABC", None, ['promo'], fixed_number=1)
+                    candidate = select_commercials("ABC", remaining_now, ['promo'], fixed_number=1)
                 else:
-                    candidate = select_mixed_commercials(999, ['Games', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Games', 'General'])
                 if not candidate:
                     pass
 
@@ -2903,11 +2817,11 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                     break
 
                 # Try a small filler piece
-                pick_one = range(1, 7)
+                pick_one = random.randint(1, 7)
                 if pick_one in range(2, 4):
-                    candidate = select_commercials("ABC", None, ['promo'], fixed_number=1)
+                    candidate = select_commercials("ABC", remaining_now, ['promo'], fixed_number=1)
                 else:
-                    candidate = select_mixed_commercials(999, ['Not Kids', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'General'])
                 if not candidate:
                     pass
 
@@ -3011,20 +2925,12 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 9)
                 if pick_one in range(1, 6):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 else:
-                    candidate = select_commercials('ABC Jetix', None, ['promo'], fixed_number=1)
+                    candidate = select_commercials('ABC Jetix', remaining_now, ['promo'], fixed_number=1)
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
+
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -3071,11 +2977,11 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
 
             # --- Return bump (ALWAYS FIRST) ---
             if current_show == next_show:
-                Wb_return = select_commercials('Jetix Back', None, [current_show], fixed_number=1)
+                Wb_return = select_commercials('Jetix Return', None, [current_show], fixed_number=1)
                 if Wb_return:
                     return_bump_to_add.extend(Wb_return)
                 else:
-                    first_bumper = select_commercials('Jetix Back', None, ['Generic'], fixed_number=1)
+                    first_bumper = select_commercials('Jetix Return', None, ['Generic'], fixed_number=1)
                     return_bump_to_add.extend(first_bumper)
 
 
@@ -3093,11 +2999,11 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
 
             # --- Back bump (ALWAYS LAST) if same show continues ---
             if current_show == next_show:
-                Wb_return = select_commercials('Jetix Return', None, [current_show], fixed_number=1)
+                Wb_return = select_commercials('Jetix Back', None, [current_show], fixed_number=1)
                 if Wb_return:
                     back_bump_to_add.extend(Wb_return)
                 else:
-                    first_bumper = select_commercials('Jetix Return', None, ['Generic'], fixed_number=1)
+                    first_bumper = select_commercials('Jetix Back', None, ['Generic'], fixed_number=1)
                     back_bump_to_add.extend(first_bumper)
 
 
@@ -3130,9 +3036,9 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 9)
                 if pick_one in range(3, 6):
-                    candidate = select_mixed_commercials(999, ['Toys', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Toys', 'Games', 'General'])
                 else:
-                    candidate = select_commercials('Jetix', None, ['promo'], fixed_number=1)
+                    candidate = select_commercials('Jetix', remaining_now, ['promo'], fixed_number=1)
                 if not candidate:
                     pass
 
@@ -3216,22 +3122,14 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                     break
 
                 # Try a small filler piece
-                pick_one = range(1, 7)
+                pick_one = random.randint(1, 7)
                 if pick_one == 3:
-                    candidate = select_commercials('Comedy Central', None, ['promo'], fixed_number=1)
+                    candidate = select_commercials('Comedy Central', remaining_now, ['promo'], fixed_number=1)
                 else:
-                    candidate = select_mixed_commercials(999, ['Not Kids', 'Games', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'Games', 'General'])
                 if not candidate:
                     pass
-                # Fallback: after many tries, attempt a generic short pool once (still obeys remaining_now)
-                if attempts in (10, 20, 30):
-                    try:
-                        fallback = select_mixed_commercials(999, ['General'])
-                    except Exception:
-                        fallback = None
-                    if fallback:
-                        candidate = fallback
-                    continue
+
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
                 if candidate_duration > remaining_now:
@@ -3310,9 +3208,9 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 7)
                 if pick_one == 3:
-                    candidate = select_commercials("Sci-Fi", None, ['promo'], fixed_number=1)
+                    candidate = select_commercials("Sci-Fi", remaining_now, ['promo'], fixed_number=1)
                 else:
-                    candidate = select_mixed_commercials(999, ['Not Kids', 'Games', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'Games', 'General'])
 
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
@@ -3377,16 +3275,25 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 # Try a small filler piece
                 pick_one = random.randint(1, 7)
                 if pick_one == 3:
-                    candidate = select_mixed_commercials(999, ['Not Kids', 'Games', ' General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'Games', 'General'])
                 else:
-                    candidate = select_commercials("Anime Trailer", None, ['promo'], fixed_number=1)
+                    candidate = select_commercials("Anime Trailer", remaining_now, ['promo'], fixed_number=1)
 
+                if not candidate:
+                    # Normal pool has nothing that fits remaining_now.
+                    # Try a short clip — select_commercials will only return one if its Duration <= remaining_now.
+                    candidate = select_commercials("Anime Trailer", remaining_now, ['short'], fixed_number=1)
+                    if candidate:
+                        filler_ads.extend(candidate)
+                        filler_total_duration += sum(get_duration_by_path(p) for p in candidate)
+                    # Either way, we're done filling this break.
+                    break
 
                 candidate_duration = sum(get_duration_by_path(p) for p in candidate)
+
                 if candidate_duration > remaining_now:
                     continue
-                if candidate_duration > remaining_now:
-                    continue
+
                 projected_total = (
                         sum(get_duration_by_path(p) for p in return_bump_to_add)
                         + sum(get_duration_by_path(p) for p in commercials_to_add)
@@ -3406,6 +3313,106 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                         break  # close enough
                 else:
                     continue  # too long, try something smaller
+
+            remaining_after = (
+                break_duration
+                - filler_total_duration
+            )
+
+            if random.randint(1,20) == 3:
+                if 0 < remaining_after <= 13:
+                    short_clip = select_commercials("Anime Trailer", remaining_after, ['short'], fixed_number=1)
+                    if short_clip:
+                        filler_ads.extend(short_clip)
+                        filler_total_duration += sum(get_duration_by_path(p) for p in short_clip)
+
+
+            # Add best attempt filler
+            commercials_to_add.extend(filler_ads)
+
+            filler_duration = sum(get_duration_by_path(path) for path in commercials_to_add)
+
+            # --- Final order: RETURN → shuffled middle → BACK ---
+            random.shuffle(commercials_to_add)
+            selected_commercials.extend(commercials_to_add)
+
+        elif channel_block in ["Anime Movie"]:
+            return_bump_to_add = []
+            commercials_to_add = []
+            back_bump_to_add = []
+
+            # --- Fill remaining time with filler (smart, iterative fitting) ---
+            commercials_to_add = []
+            filler_ads = []
+            filler_total_duration = 0
+            max_attempts = 100
+            attempts = 0
+
+            while attempts < max_attempts:
+                attempts += 1
+                # Time left to fill right now
+
+                remaining_now = (
+                        break_duration
+                        - sum(get_duration_by_path(p) for p in commercials_to_add)
+                        - filler_total_duration
+                )
+
+                if remaining_now <= 0:
+                    break
+
+                # Try a small filler piece
+                pick_one = random.randint(1, 7)
+                if pick_one == 3:
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'Games', 'General'])
+                else:
+                    candidate = select_commercials("Anime Trailer", remaining_now, ['promo'], fixed_number=1)
+
+                if not candidate:
+                    # Normal pool has nothing that fits remaining_now.
+                    # Try a short clip — select_commercials will only return one if its Duration <= remaining_now.
+                    candidate = select_commercials("Anime Trailer", remaining_now, ['short'], fixed_number=1)
+                    if candidate:
+                        filler_ads.extend(candidate)
+                        filler_total_duration += sum(get_duration_by_path(p) for p in candidate)
+                    # Either way, we're done filling this break.
+                    break
+
+                candidate_duration = sum(get_duration_by_path(p) for p in candidate)
+
+                if candidate_duration > remaining_now:
+                    continue
+
+                projected_total = (
+                        sum(get_duration_by_path(p) for p in return_bump_to_add)
+                        + sum(get_duration_by_path(p) for p in commercials_to_add)
+                        + filler_total_duration
+                        + candidate_duration
+                        + sum(get_duration_by_path(p) for p in back_bump_to_add)
+                )
+
+                if projected_total <= break_duration:
+                    filler_ads.extend(candidate)
+                    filler_total_duration += candidate_duration
+                    slack = break_duration - projected_total
+                    if 0 <= slack <= STOP_SLACK_SECONDS:
+                        break
+
+                    if projected_total >= break_duration:
+                        break  # close enough
+                else:
+                    continue  # too long, try something smaller
+
+            remaining_after = (
+                break_duration
+                - filler_total_duration
+            )
+            if 0 < remaining_after <= 13:
+                short_clip = select_commercials("Anime Trailer", remaining_after, ['short'], fixed_number=1)
+                if short_clip:
+                    filler_ads.extend(short_clip)
+                    filler_total_duration += sum(get_duration_by_path(p) for p in short_clip)
+
 
             # Add best attempt filler
             commercials_to_add.extend(filler_ads)
@@ -3446,7 +3453,7 @@ def get_commercials_for_show(channel_block, break_duration, first_show_in_block,
                 if pick_one == 3:
                     candidate = select_commercials("NFO", None, ['Info'], fixed_number=1)
                 else:
-                    candidate = select_mixed_commercials(999, ['Not Kids', 'Games', 'General'])
+                    candidate = select_mixed_commercials(remaining_now, ['Not Kids', 'Games', 'General'])
 
                 # === end pick logic ===
 
