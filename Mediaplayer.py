@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import simpledialog
 import socket
 import json
+import math
 
 
 import faulthandler
@@ -25,14 +26,14 @@ import faulthandler
 faulthandler.enable(open("crashlog.txt", "w"))
 
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QMessageBox, QHBoxLayout, \
-    QLabel, QSizePolicy, QDialog, QInputDialog, QDesktopWidget
+    QLabel, QSizePolicy, QDialog, QInputDialog, QDesktopWidget, QScrollArea, QLineEdit, QListWidget, \
+    QListWidgetItem, QSpinBox, QComboBox, QDialogButtonBox, QTabWidget
 from PyQt5.QtCore import Qt, pyqtSlot, QTimer, QMetaObject, Q_ARG
 from PyQt5.QtGui import QPixmap
 
 import commercial_scheduler
 from evdev import InputDevice, ecodes
 from PyQt5.QtCore import QSocketNotifier
-
 
 class SelectionDialog(QDialog):
     def __init__(self, prompt, options, parent=None):
@@ -63,6 +64,137 @@ def get_selection(prompt, options):
     return None
 
 
+class ShowPickerDialog(QDialog):
+    """Pick one specific show or movie, which block it plays in, and how many episodes."""
+
+    def __init__(self, tv_shows_to_blocks, movie_shows_to_blocks, unwatched_counts, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pick a Show")
+        self.unwatched_counts = unwatched_counts
+
+        self.selected_show = None
+        self.selected_block = None
+        self.episode_count = 1
+        self.is_movie = False
+
+        self.layout = QVBoxLayout(self)
+
+        # Declared before build_page() runs: its signals reach back into current_page()
+        self.tv_page = None
+        self.movie_page = None
+
+        self.tabs = QTabWidget(self)
+        self.tv_page = self.build_page(tv_shows_to_blocks, unwatched_counts)
+        self.movie_page = self.build_page(movie_shows_to_blocks, unwatched_counts)
+        self.tabs.addTab(self.tv_page['widget'], "TV Shows")
+        self.tabs.addTab(self.movie_page['widget'], "Movies")
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.layout.addWidget(self.tabs)
+
+        block_row = QHBoxLayout()
+        block_row.addWidget(QLabel("Block:", self))
+        self.block_box = QComboBox(self)
+        block_row.addWidget(self.block_box)
+        self.count_label = QLabel("Episodes:", self)
+        block_row.addWidget(self.count_label)
+        self.count_box = QSpinBox(self)
+        self.count_box.setRange(1, 20)
+        self.count_box.setValue(1)
+        block_row.addWidget(self.count_box)
+        self.layout.addLayout(block_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, Qt.Horizontal, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.layout.addWidget(buttons)
+
+        # Select a default row only now that both pages exist
+        for page in (self.tv_page, self.movie_page):
+            if page['list'].count():
+                page['list'].setCurrentRow(0)
+
+        self.on_tab_changed(0)
+
+    def build_page(self, shows_to_blocks, unwatched_counts):
+        """Build one tab: a search box over a list of titles."""
+        page = QWidget(self)
+        page_layout = QVBoxLayout(page)
+
+        search_box = QLineEdit(page)
+        search_box.setPlaceholderText("Type to filter...")
+        page_layout.addWidget(search_box)
+
+        show_list = QListWidget(page)
+        for show in sorted(shows_to_blocks.keys(), key=lambda s: s.lower()):
+            left = unwatched_counts.get(show, 0)
+            item = QListWidgetItem("{}  ({} unwatched)".format(show, left))
+            item.setData(Qt.UserRole, show)
+            show_list.addItem(item)
+        page_layout.addWidget(show_list)
+
+        page_data = {'widget': page, 'search': search_box, 'list': show_list,
+                     'blocks': shows_to_blocks}
+
+        search_box.textChanged.connect(lambda text, p=page_data: self.filter_shows(p, text))
+        show_list.currentItemChanged.connect(lambda cur, prev: self.refresh_blocks())
+        show_list.itemDoubleClicked.connect(lambda _item: self.accept())
+
+        return page_data
+
+    def current_page(self):
+        return self.movie_page if self.tabs.currentIndex() == 1 else self.tv_page
+
+    def on_tab_changed(self, _index):
+        page = self.current_page()
+        if page is None:
+            return
+        # A movie is a single title, so the episode count only applies to TV
+        movies = page is self.movie_page
+        self.count_label.setVisible(not movies)
+        self.count_box.setVisible(not movies)
+        self.refresh_blocks()
+        page['search'].setFocus()
+
+    def filter_shows(self, page, text):
+        show_list = page['list']
+        text = text.strip().lower()
+        first_visible = None
+        for i in range(show_list.count()):
+            item = show_list.item(i)
+            match = text in item.data(Qt.UserRole).lower()
+            item.setHidden(not match)
+            if match and first_visible is None:
+                first_visible = i
+        # Keep a sensible selection so Enter/OK always has a target
+        current = show_list.currentItem()
+        if first_visible is not None and (current is None or current.isHidden()):
+            show_list.setCurrentRow(first_visible)
+        self.refresh_blocks()
+
+    def refresh_blocks(self):
+        page = self.current_page()
+        if page is None:
+            return
+        self.block_box.clear()
+        item = page['list'].currentItem()
+        if item is None:
+            return
+        for block in page['blocks'].get(item.data(Qt.UserRole), []):
+            self.block_box.addItem(block)
+
+    def accept(self):
+        page = self.current_page()
+        item = page['list'].currentItem()
+        if item is None or item.isHidden():
+            QMessageBox.information(self, "Pick a Show", "Select a title first.")
+            return
+        self.is_movie = page is self.movie_page
+        self.selected_show = item.data(Qt.UserRole)
+        self.selected_block = self.block_box.currentText() or "General"
+        self.episode_count = 1 if self.is_movie else self.count_box.value()
+        super().accept()
+
+
 @pyqtSlot(int)
 def show_overlay(self, duration):
     # Create the overlay as a child of your main widget so it appears properly
@@ -73,6 +205,502 @@ def show_overlay(self, duration):
     overlay.show()
     # Close the overlay after the specified duration (in milliseconds)
     QTimer.singleShot(duration, overlay.close)
+
+class TVGuideChannel(QWidget):
+    """Full-screen TV Guide Channel — embedded video top, 3-col grid bottom."""
+
+    BG         = "#0a0a2e"
+    HDR_BG     = "#000060"
+    BORDER     = "#223366"
+    GOLD       = "#ffcc00"
+    ORANGE     = "#ffaa00"
+    BLUE_CH    = "#88aaff"
+    TEXT       = "#d0d8ff"
+    TEXT_NOW   = "#ffffff"
+    ROW_ODD    = "#0d1a4a"
+    ROW_EVEN   = "#071030"
+    HDR_ROW    = "#001050"
+    CELL_NOW   = "#0a2a5e"
+
+    W_CH   = 160   # channel-name column
+    W_CELL = 220   # each of the 3 time-slot cells (3×220=660 + 160 = 820px total)
+
+    def __init__(self, channel_playlists, channels, player=None):
+        super().__init__(None)          # always None — must be a top-level window
+        self._guide_mpv   = None   # embedded mpv process
+        self._channel_playlists = channel_playlists
+        # Add these two lines right after self._channel_playlists = channel_playlists:
+        self._channels = channels
+        self._parent_player = player  # will be None if not passed — handled gracefully
+
+
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setStyleSheet("background-color: " + self.BG + ";")
+
+        screen = QDesktopWidget().availableGeometry()
+        self.setGeometry(screen)
+        # Responsive sizing for small screens (CRT / 480p)
+        self.W_CH   = min(160, max(90,  screen.width() // 7))
+        self.W_CELL = min(220, max(130, (screen.width() - self.W_CH - 20) // 3))
+        self._row_h = 32 if screen.height() < 600 else 42
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        now_abs = self._now_abs()
+
+        # ── Top bar ─────────────────────────────────────────────────
+        top_bar = QWidget()
+        top_bar.setFixedHeight(44)
+        top_bar.setStyleSheet(
+            "background: " + self.HDR_BG + ";"
+            "border-bottom: 2px solid " + self.BORDER + ";"
+        )
+        tbl = QHBoxLayout(top_bar)
+        tbl.setContentsMargins(50, 0, 18, 0)
+
+        logo = QLabel("TV GUIDE CHANNEL")
+        logo.setStyleSheet(
+            "color: " + self.GOLD + "; font: bold 20px 'Courier New';"
+        )
+        tbl.addWidget(logo)
+        tbl.addStretch()
+
+        self._clock_label = QLabel()
+        self._clock_label.setStyleSheet(
+            "color: " + self.ORANGE + "; font: bold 18px 'Courier New';"
+        )
+        tbl.addWidget(self._clock_label)
+        root.addWidget(top_bar)
+
+        # ── Video + info row ──────────────────────────────────────────
+        video_height = int(screen.height() * 0.36)
+
+        video_row = QWidget()
+        video_row.setFixedHeight(video_height)
+        video_row.setStyleSheet("background: #000000;")
+        video_row_layout = QHBoxLayout(video_row)
+        video_row_layout.setContentsMargins(0, 0, 0, 0)
+        video_row_layout.setSpacing(0)
+
+        # Left: 4:3 video container (height × 4/3)
+        video_w = int(video_height * 4 / 3)
+        self._video_frame = QWidget(video_row)
+        self._video_frame.setFixedSize(video_w, video_height)
+        self._video_frame.setStyleSheet("background: #000000;")
+        video_row_layout.addWidget(self._video_frame)
+
+        # Divider line
+        vdiv = QWidget()
+        vdiv.setFixedWidth(2)
+        vdiv.setStyleSheet("background: " + self.BORDER + ";")
+        video_row_layout.addWidget(vdiv)
+
+        # Right: now-playing info panel
+        info_panel = QWidget()
+        info_panel.setStyleSheet(
+            "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            "stop:0 #000a30, stop:1 #0a1a60);"
+        )
+        ip_layout = QVBoxLayout(info_panel)
+        ip_layout.setContentsMargins(16, 12, 16, 12)
+        ip_layout.setSpacing(8)
+
+        np_label = QLabel("NOW PLAYING")
+        np_label.setStyleSheet(
+            "color: " + self.GOLD + "; font: bold 11px 'Courier New';"
+                                    "background: transparent;"
+        )
+        ip_layout.addWidget(np_label)
+
+        # Populate with currently-airing info from first available channel
+        now_abs_for_info = self._now_abs()
+
+        # Build sorted rotation list (skip Music)
+        self._info_channels = [
+            ch for ch in channel_playlists.keys() if ch != "Music"
+        ]
+        self._info_idx = 0
+
+        # Seed with the first channel that has a current entry
+        info_show, info_ep, info_ch, info_time = "—", "—", "—", "—"
+        for i, ch_name in enumerate(self._info_channels):
+            pl = channel_playlists.get(ch_name) or []
+            e = self._find_at(pl, now_abs_for_info)
+            if e:
+                self._info_idx = i
+                info_ch = ch_name
+                info_show = str(e[0])
+                info_ep = str(e[1])[:70]
+                info_time = self._fmt_abs(e[3]) + " on air now"
+                break
+
+        self._ch_lbl = QLabel(info_ch)
+        self._ch_lbl.setStyleSheet(
+            "color: " + self.GOLD + "; font: bold 22px 'Courier New';"
+                                    "background: transparent;"
+        )
+        ip_layout.addWidget(self._ch_lbl)
+
+        self._time_lbl = QLabel(info_time)
+        self._time_lbl.setStyleSheet(
+            "color: " + self.ORANGE + "; font: 13px 'Courier New';"
+                                      "background: transparent;"
+        )
+        ip_layout.addWidget(self._time_lbl)
+
+        self._show_lbl = QLabel(info_show)
+        self._show_lbl.setStyleSheet(
+            "color: #ffffff; font: bold 17px 'Courier New';"
+            "background: transparent;"
+        )
+        self._show_lbl.setWordWrap(True)
+        ip_layout.addWidget(self._show_lbl)
+
+        self._ep_lbl = QLabel(info_ep)
+        self._ep_lbl.setStyleSheet(
+            "color: " + self.TEXT + "; font: 12px 'Courier New';"
+                                    "background: transparent;"
+        )
+        self._ep_lbl.setWordWrap(True)
+        ip_layout.addWidget(self._ep_lbl)
+        ip_layout.addStretch()
+
+        video_row_layout.addWidget(info_panel, 1)
+        root.addWidget(video_row)
+
+        # Divider bar between video row and grid
+        div_bar = QWidget()
+        div_bar.setFixedHeight(4)
+        div_bar.setStyleSheet(
+            "background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 " + self.GOLD + ", stop:0.5 " + self.ORANGE + ", stop:1 " + self.GOLD + ");"
+        )
+        root.addWidget(div_bar)
+
+        # 3 time columns: current 30-min slot, +30m, +60m
+        slot0 = (now_abs // 1800) * 1800
+        slot1 = slot0 + 1800
+        slot2 = slot0 + 3600
+
+        # ── FIXED column header (outside scroll area) ──────────────
+        hdr = self._make_grid_row(
+            "CHANNEL",
+            [self._fmt_abs(slot0), self._fmt_abs(slot1), self._fmt_abs(slot2)],
+            row_index=0,
+            is_header=True,
+            merge01=False, merge12=False, merge012=False,
+        )
+        root.addWidget(hdr)        # ← goes directly into root layout, NOT into vbox
+
+        # ── Scroll area for channel grid ────────────────────────────
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll_area.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+        )
+        root.addWidget(self._scroll_area)
+
+        # ── Grid content ────────────────────────────────────────────
+        content = QWidget()
+        content.setStyleSheet("background-color: " + self.BG + ";")
+        content.setMinimumWidth(self.W_CH + self.W_CELL * 3 + 40)
+        vbox = QVBoxLayout(content)
+        vbox.setSpacing(0)
+        vbox.setContentsMargins(0, 0, 0, 0)
+
+        skip = {"Music"}
+        row_idx = 1
+        _row_data = []   # ← collect args to rebuild duplicates
+
+        for ch_name in channel_playlists.keys():
+            if ch_name in skip:
+                continue
+            playlist = channel_playlists.get(ch_name) or []
+
+            entry0 = self._find_at(playlist, slot0)
+            entry1 = self._find_at(playlist, slot1)
+            entry2 = self._find_at(playlist, slot2)
+            label0 = self._entry_label(entry0)
+            label1 = self._entry_label(entry1)
+            label2 = self._entry_label(entry2)
+            cells = [label0, label1, label2]
+
+            merge012 = (
+                entry0 is not None and entry1 is not None and entry2 is not None
+                and entry0[0] == entry1[0] and entry0[1] == entry1[1]
+                and entry1[0] == entry2[0] and entry1[1] == entry2[1]
+            )
+            merge01 = (not merge012 and entry0 is not None and entry1 is not None
+                       and entry0[0] == entry1[0] and entry0[1] == entry1[1])
+            merge12 = (not merge012 and not merge01 and entry1 is not None and entry2 is not None
+                       and entry1[0] == entry2[0] and entry1[1] == entry2[1])
+
+            _row_data.append((ch_name, cells, row_idx, merge01, merge12, merge012))
+            vbox.addWidget(
+                self._make_grid_row(ch_name, cells, row_idx, is_header=False,
+                                    merge01=merge01, merge12=merge12, merge012=merge012)
+            )
+            row_idx += 1
+
+        # ── Duplicate rows for seamless loop ──────────────────────────
+        for (ch_name, cells, orig_idx, merge01, merge12, merge012) in _row_data:
+            vbox.addWidget(
+                self._make_grid_row(ch_name, cells, orig_idx, is_header=False,
+                                    merge01=merge01, merge12=merge12, merge012=merge012)
+            )
+
+        vbox.addStretch()
+        self._scroll_area.setWidget(content)
+
+        # ── Timers ──────────────────────────────────────────────────
+        self._scroll_px = 0.0
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.timeout.connect(self._tick_scroll)
+        self._scroll_timer.start(33)
+
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self._tick_clock)
+        self._clock_timer.start(1000)
+        self._tick_clock()
+
+        # Info-card rotation timer — advance channel every 5 seconds
+        self._info_timer = QTimer(self)
+        self._info_timer.timeout.connect(self._tick_info)
+        self._info_timer.start(5000)
+
+        # Launch embedded mpv after a short delay (window must be shown first)
+        QTimer.singleShot(400, self._launch_embedded_mpv)
+
+    def _tick_info(self):
+        """Rotate the now-playing info card to the next channel."""
+        if not self._info_channels:
+            return
+        self._info_idx = (self._info_idx + 1) % len(self._info_channels)
+        ch_name = self._info_channels[self._info_idx]
+        pl = self._channel_playlists.get(ch_name) or []
+        now_abs = self._now_abs()
+        e = self._find_at(pl, now_abs)
+
+        if e:
+            self._ch_lbl.setText(ch_name)
+            self._time_lbl.setText(self._fmt_abs(e[3]) + " on air now")
+            self._show_lbl.setText(str(e[0]))
+            self._ep_lbl.setText(str(e[1])[:70])
+        else:
+            self._ch_lbl.setText(ch_name)
+            self._time_lbl.setText("—")
+            self._show_lbl.setText("—")
+            self._ep_lbl.setText("")
+
+    # ── Video embed ──────────────────────────────────────────────────
+
+    def _launch_embedded_mpv(self):
+        """Embed a shuffled playlist via mpv --wid. Playlist is generated once and reused."""
+        import random
+
+        tmp_playlist = "Tv_guide.m3u"
+
+        # Only build the playlist if it doesn't already exist from a prior session
+        if not os.path.isfile(tmp_playlist):
+            sources = [v for v in self._channels.values() if v != "__guide__" and v]
+
+            files = []
+            seen = set()
+            for m3u in sources:
+                if not os.path.isfile(m3u):
+                    continue
+                try:
+                    with open(m3u, "r", errors="ignore") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#") and os.path.isfile(line):
+                                if line not in seen:
+                                    files.append(line)
+                                    seen.add(line)
+                except Exception:
+                    continue
+
+            if not files:
+                print("[TVGuide] No media files found — video area stays black.")
+                return
+
+            random.shuffle(files)
+            try:
+                with open(tmp_playlist, "w") as f:
+                    f.write("#EXTM3U\n")
+                    for fn in files:
+                        f.write(fn + "\n")
+            except Exception as e:
+                print("[TVGuide] Could not write playlist:", e)
+                return
+
+        wid = int(self._video_frame.winId())
+        cmd = [
+            "mpv",
+            "--wid=%d" % wid,
+            "--no-osc",
+            "--no-input-default-bindings",
+            "--mute=no",
+            "--loop-playlist=inf",
+            "--shuffle",               # ← ADD THIS LINE
+            "--no-border",
+            "--playlist=" + tmp_playlist,
+        ]
+        try:
+            self._guide_mpv = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            print("[TVGuide] embedded mpv failed:", e)
+
+    # ── Helpers ──────────────────────────────────────────────────────
+
+    def _now_abs(self):
+        """Seconds since midnight — matches slot_start_sec (start_h * 3600)."""
+        n = datetime.datetime.now()
+        return n.hour * 3600 + n.minute * 60 + n.second
+
+    def _fmt_abs(self, sec):
+        """Format seconds-since-midnight as '5:00 PM'."""
+        try:
+            h = (int(sec) // 3600) % 24
+            m = (int(sec) % 3600) // 60
+            h12 = h % 12 or 12
+            ampm = "AM" if h < 12 else "PM"
+            return "%d:%02d %s" % (h12, m, ampm)
+        except Exception:
+            return "?"
+
+    def _find_at(self, playlist, abs_sec):
+        """Return the playlist 4-tuple that is on air at abs_sec."""
+        result = None
+        for entry in playlist:
+            if len(entry) < 4:
+                continue
+            try:
+                slot = int(entry[3])
+            except (ValueError, TypeError):
+                continue
+            if slot <= abs_sec:
+                result = entry
+            else:
+                break
+        return result
+
+    def _entry_label(self, entry):
+        """Short 'Show - Episode' string from a 4-tuple."""
+        if not entry:
+            return "—"
+        show = str(entry[0])[:22]
+        ep   = str(entry[1])[:26]
+        return "%s - %s" % (show, ep)
+
+    def _make_grid_row(self, ch_str, cells, row_index, is_header,
+                       raw_playlists=None, abs_slots=None,
+                       merge01=False, merge12=False, merge012=False):
+        """Build one grid row with optional merged double-width cells."""
+        row = QWidget()
+        row.setFixedHeight(26 if is_header else self._row_h)
+        if is_header:
+            bg = self.HDR_ROW
+        elif row_index % 2:
+            bg = self.ROW_ODD
+        else:
+            bg = self.ROW_EVEN
+        row.setStyleSheet(
+            "background: " + bg + ";"
+            "border-bottom: 1px solid " + self.BORDER + ";"
+        )
+
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(0)
+
+        weight = "bold " if is_header else ""
+
+        def cell(text, color, width, bg_override=None, align=Qt.AlignLeft):
+            w = QWidget()
+            w.setFixedWidth(width)
+            cell_bg = bg_override if bg_override else "transparent"
+            w.setStyleSheet(
+                "background: " + cell_bg + ";"
+                "border-right: 1px solid " + self.BORDER + ";"
+            )
+            cl = QHBoxLayout(w)
+            cl.setContentsMargins(8, 0, 6, 0)
+            lbl = QLabel(str(text))
+            lbl.setStyleSheet(
+                "color: " + color + ";"
+                "font: " + weight + "12px 'Courier New';"
+                "background: transparent;"
+            )
+            lbl.setAlignment(Qt.AlignVCenter | align)
+            lbl.setWordWrap(False)
+            cl.addWidget(lbl)
+            return w
+
+        cc = self.GOLD    if is_header else self.BLUE_CH
+        tc = self.GOLD    if is_header else self.TEXT_NOW
+        nc = self.GOLD    if is_header else self.TEXT
+
+        # Channel name — right-aligned (issue 4)
+        ch_align = Qt.AlignCenter if is_header else Qt.AlignRight
+        rl.addWidget(cell(ch_str, cc, self.W_CH, align=ch_align))
+
+        if is_header:
+            rl.addWidget(cell(cells[0], tc, self.W_CELL, align=Qt.AlignCenter))
+            rl.addWidget(cell(cells[1], nc, self.W_CELL, align=Qt.AlignCenter))
+            rl.addWidget(cell(cells[2], nc, self.W_CELL, align=Qt.AlignCenter))
+        elif merge012:                                                   # ← ADD THIS BLOCK
+            # All 3 slots are the same show (e.g. 2-hour movie) → one triple-width cell
+            rl.addWidget(cell(cells[0], tc, self.W_CELL * 3 + 2, self.CELL_NOW))
+        elif merge01:
+            rl.addWidget(cell(cells[0], tc, self.W_CELL * 2 + 1, self.CELL_NOW))
+            rl.addWidget(cell(cells[2], nc, self.W_CELL))
+        elif merge12:
+            rl.addWidget(cell(cells[0], tc, self.W_CELL, self.CELL_NOW))
+            rl.addWidget(cell(cells[1], nc, self.W_CELL * 2 + 1))
+        else:
+            rl.addWidget(cell(cells[0], tc, self.W_CELL, self.CELL_NOW))
+            rl.addWidget(cell(cells[1], nc, self.W_CELL))
+            rl.addWidget(cell(cells[2], nc, self.W_CELL))
+
+        rl.addStretch()
+        return row
+
+    def _tick_scroll(self):
+        bar = self._scroll_area.verticalScrollBar()
+        self._scroll_px += 0.4
+        pos = int(self._scroll_px)
+        max_val = bar.maximum()
+        if max_val > 0:
+            half = max_val // 2
+            if pos >= half:
+                # Reset to identical position in first copy — seamless!
+                self._scroll_px -= half
+                pos = int(self._scroll_px)
+        bar.setValue(pos)
+
+    def _tick_clock(self):
+        self._clock_label.setText(
+            datetime.datetime.now().strftime("%A  %I:%M:%S %p")
+        )
+
+    def stop(self):
+        self._scroll_timer.stop()
+        self._clock_timer.stop()
+        self._info_timer.stop()      # ← ADD THIS
+        if self._guide_mpv is not None:
+            try:
+                self._guide_mpv.terminate()
+            except Exception:
+                pass
+            self._guide_mpv = None
+        self.hide()
 
 
 class CustomMediaPlayer(QWidget):
@@ -112,6 +740,10 @@ class CustomMediaPlayer(QWidget):
         self.play_button.clicked.connect(self.toggle_play_pause)
         self.layout.addWidget(self.play_button)
 
+        self.skip_button = QPushButton("Clear Playlist")
+        self.skip_button.clicked.connect(self.clear_playlist)
+        self.layout.addWidget(self.skip_button)
+
         self.skip_button = QPushButton("Old Live TV")
         self.skip_button.clicked.connect(self.play_live_tv_now)
         self.layout.addWidget(self.skip_button)
@@ -123,6 +755,10 @@ class CustomMediaPlayer(QWidget):
         self.kodi_button = QPushButton("'Live' Schedule")
         self.kodi_button.clicked.connect(self.create_kodi_schedule)
         self.layout.addWidget(self.kodi_button)
+
+        self.pick_show_button = QPushButton("Pick a Show")
+        self.pick_show_button.clicked.connect(self.create_custom_schedule_pick_show)
+        self.layout.addWidget(self.pick_show_button)
 
         self.custom_schedule_unwatched_movie = QPushButton("Movie")
         self.custom_schedule_unwatched_movie.clicked.connect(self.create_custom_schedule_movie)
@@ -202,7 +838,20 @@ class CustomMediaPlayer(QWidget):
         self.is_no_wb = False
         self.manual_block = None
         self.setFocusPolicy(Qt.StrongFocus)
+        self.guide_window = None
 
+        # ✅ LOAD GUIDE DATA ON STARTUP
+        import json, os
+        if os.path.exists("guide_data.json"):
+            try:
+                with open("guide_data.json", "r") as f:
+                    self.channel_playlists = json.load(f)
+                print("[Guide] Loaded schedule from disk")
+            except Exception as e:
+                print(f"[Guide] Error loading: {e}")
+                self.channel_playlists = {}
+        else:
+            self.channel_playlists = {}
         # Scale popup to screen size
         self.scale_popup_to_screen()
 
@@ -213,6 +862,7 @@ class CustomMediaPlayer(QWidget):
 
         self.channels = {
             "FOX": "Fox.m3u",
+            "TV Guide": "__guide__",  # ← ADD THIS
             "THE WB": "WB.m3u",
             "Toon Disney": "ToonDisney.m3u",
             "Music": "Music.m3u",
@@ -227,6 +877,7 @@ class CustomMediaPlayer(QWidget):
         }
 
         self.sves_on = False
+        self.sves_on_p = False
 
         # Track elapsed time for each channel
         self.channel_elapsed_time = {channel: 0 for channel in self.channels}
@@ -264,8 +915,8 @@ class CustomMediaPlayer(QWidget):
         # Start with PowerHour (or any other you want)
         # self.current_channel_index = self.channel_list.index("PowerHour")
         # self.switch_channel("PowerHour", force_reset=True)
-        self.get_playlist_duration("PowerHour")
         self.export_all_playlists_to_csv()
+        self.get_playlist_duration("PowerHour")
         self.get_playlist_duration("Toonami")
         self.get_playlist_duration("Miguzi")
         self.get_playlist_duration("ABC")
@@ -277,7 +928,7 @@ class CustomMediaPlayer(QWidget):
         self.get_playlist_duration("Anime")
         self.get_playlist_duration("Music")
         self.get_playlist_duration("Sci-Fi")
-        self.play_vlc()
+
 
     def setupGlobalShortcuts(self):
         # Toggle play/pause with a global shortcut
@@ -289,8 +940,11 @@ class CustomMediaPlayer(QWidget):
         button = QPushButton(text)
         button.clicked.connect(callback)
         button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        button.setStyleSheet("font-size: 18px;")
+        button.setStyleSheet("font-size: 20px;")
         return button
+
+    def clear_playlist(self):
+        self.playlist.clear()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -316,6 +970,118 @@ class CustomMediaPlayer(QWidget):
             return duration
         else:
             return None
+
+    @staticmethod
+    def is_movie_block(block):
+        """Movie blocks are the '... Movie' columns plus Cartoon Theater."""
+        block = (block or '').strip().lower()
+        return block.endswith("movie") or block == "cartoon theater"
+
+    def get_all_shows_with_blocks(self):
+        """Map every show in shows.csv to the block columns it appears in."""
+        shows_to_blocks = {}
+        try:
+            with open('shows.csv', newline='', encoding='utf-8-sig', errors='ignore') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    for block, show in row.items():
+                        if not block or not show:
+                            continue
+                        block = block.strip()
+                        show = show.strip()
+                        if not block or not show or block.upper().startswith("IGNORE"):
+                            continue
+                        blocks = shows_to_blocks.setdefault(show, [])
+                        if block not in blocks:
+                            blocks.append(block)
+        except Exception as e:
+            print(f"[get_all_shows_with_blocks] Error reading shows.csv: {e}")
+        return shows_to_blocks
+
+    def get_unwatched_counts(self):
+        """Count remaining unwatched (Played == 'no') rows per show in Episodes.csv."""
+        counts = {}
+        try:
+            with open('Episodes.csv', newline='', encoding='utf-8-sig', errors='ignore') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    show = (row.get('Show') or '').strip()
+                    played = (row.get('Played') or '').strip().lower()
+                    if show and played == 'no':
+                        counts[show] = counts.get(show, 0) + 1
+        except Exception as e:
+            print(f"[get_unwatched_counts] Error reading Episodes.csv: {e}")
+        return counts
+
+    def get_next_unwatched_episodes(self, show, count=1):
+        """
+        Return the next `count` unwatched episodes for a show, in CSV order.
+        Multi-part entries ('A / B') are expanded fully so two-parters stay together.
+        """
+        episodes = []
+        try:
+            with open('Episodes.csv', newline='', encoding='utf-8-sig', errors='ignore') as csvfile:
+                reader = csv.DictReader(csvfile)
+                picked = 0
+                for row in reader:
+                    if (row.get('Show') or '').strip() != show:
+                        continue
+                    if (row.get('Played') or '').strip().lower() != 'no':
+                        continue
+                    parts = [ep.strip() for ep in (row.get('Episode') or '').split(' / ') if ep.strip()]
+                    if not parts:
+                        continue
+                    episodes.extend(parts)
+                    picked += 1
+                    if picked >= count:
+                        break
+        except Exception as e:
+            print(f"[get_next_unwatched_episodes] Error reading Episodes.csv: {e}")
+        return episodes
+
+    def create_custom_schedule_pick_show(self):
+        """Pick one specific show or movie and queue its next unwatched episode(s)."""
+        shows_to_blocks = self.get_all_shows_with_blocks()
+        if not shows_to_blocks:
+            QMessageBox.warning(self, "Pick a Show", "No shows found in shows.csv.")
+            return
+
+        # Split into the two tabs, keeping only the blocks of the matching kind
+        tv_shows, movie_shows = {}, {}
+        for show, blocks in shows_to_blocks.items():
+            tv_blocks = [b for b in blocks if not self.is_movie_block(b)]
+            mv_blocks = [b for b in blocks if self.is_movie_block(b)]
+            if tv_blocks:
+                tv_shows[show] = tv_blocks
+            if mv_blocks:
+                movie_shows[show] = mv_blocks
+
+        dialog = ShowPickerDialog(tv_shows, movie_shows, self.get_unwatched_counts(), self)
+        if dialog.exec_() != QDialog.Accepted:
+            print("Show selection cancelled.")
+            return
+
+        show = dialog.selected_show
+        block = dialog.selected_block
+        episodes = self.get_next_unwatched_episodes(show, dialog.episode_count)
+
+        if not episodes:
+            kind = "movie" if dialog.is_movie else "episodes"
+            QMessageBox.information(self, "Pick a Show",
+                                    f"No unwatched {kind} left for {show}.")
+            return
+
+        self.is_random_block = True
+        self.selected_block = block
+
+        for episode in episodes:
+            self.playlist.append((show, episode, block))
+
+        self.finalize_playlist()
+
+        print(f"Custom Schedule Created (Picked): {show} ({block})")
+        for show_name, episode, blk, *_ in self.playlist:
+            print(f"Show: {show_name}, Episode: {episode}, Block: {blk}")
 
     def create_custom_schedule_movie(self):
         # --- INLINE POPUP ---
@@ -412,7 +1178,7 @@ class CustomMediaPlayer(QWidget):
             # Finalize the playlist
             self.finalize_playlist()
             print("Custom Schedule Created (Unwatched):")
-            for show, episode, block in self.playlist:
+            for show, episode, block, *_ in self.playlist:
                 print(f"Show: {show}, Episode: {episode}")
 
     def create_custom_schedule_t(self):
@@ -423,75 +1189,23 @@ class CustomMediaPlayer(QWidget):
         specific_episode = "Rock"  # Replace with your desired episode filename
         self.playlist.append((selected_movie, specific_episode, "Toonami Intro"))
 
-        play_movie = QMessageBox.question(self, "Play Movie", "Do you want to play a Special?",
-                                          QMessageBox.Yes | QMessageBox.No)
-        if play_movie == QMessageBox.Yes:
-            duration = get_selection("How long would you like to watch Toonami (hours)?", range(0, 3))
+        num_shows = 6
+        cartoon_network_shows = self.get_shows_for_block("Toonami")
 
-            # Step 1: Specify duration for Cartoon Network
-            if duration:
-                num_shows = duration * 2
-                if num_shows == 0:
-                    pass
-                else:
-                    cartoon_network_shows = self.get_shows_for_block("Toonami")
+        for _ in range(num_shows):
+            if cartoon_network_shows:  # Ensure there are still shows left to choose
+                show = random.choice(cartoon_network_shows)
+                cartoon_network_shows.remove(show)  # Remove the selected show from the list
 
-                    for _ in range(num_shows):
-                        if cartoon_network_shows:  # Ensure there are still shows left to choose
-                            show = random.choice(cartoon_network_shows)
-                            cartoon_network_shows.remove(show)  # Remove the selected show from the list
-
-                            episodes = self.get_next_unwatched_episode(show)
-                            if episodes:
-                                for episode in episodes:
-                                    self.playlist.append((show, episode, "Toonami"))
-
-            cartoon_theater_shows = self.get_shows_for_block("Toonami Movie")
-            selected_movie = random.choice(cartoon_theater_shows)
-            episodes = self.get_random_episode(selected_movie)
-
-            if episodes:
-                cartoon_network_shows = self.get_shows_for_block("Toonami")
-
-                # flatten list-of-lists exactly like normal shows
-                for ep_group in episodes:
-                    for ep in ep_group:
-                        self.playlist.append((selected_movie, ep, "Toonami Movie"))
-
-            for _ in range(4):
-
-                if cartoon_network_shows:  # Ensure there are still shows left to choose
-                    show = random.choice(cartoon_network_shows)
-                    cartoon_network_shows.remove(show)  # Remove the selected show from the list
-
-                    episodes = self.get_next_unwatched_episode(show)
-                    if episodes:
-                        for episode in episodes:
-                            self.playlist.append((show, episode, "Toonami"))
-
-
-        else:
-            duration = get_selection("How long would you like to watch Toonami (hours)?", range(2, 6))
-
-            # Step 1: Specify duration for Cartoon Network
-            if duration:
-                num_shows = duration * 2
-                cartoon_network_shows = self.get_shows_for_block("Toonami")
-
-                for _ in range(num_shows):
-                    if cartoon_network_shows:  # Ensure there are still shows left to choose
-                        show = random.choice(cartoon_network_shows)
-                        cartoon_network_shows.remove(show)  # Remove the selected show from the list
-
-                        episodes = self.get_next_unwatched_episode(show)
-                        if episodes:
-                            for episode in episodes:
-                                self.playlist.append((show, episode, "Toonami"))
+                episodes = self.get_next_unwatched_episode(show)
+                if episodes:
+                    for episode in episodes:
+                        self.playlist.append((show, episode, "Toonami"))
 
         # Finalize the playlist
         self.finalize_playlist()
         print("Custom Schedule Created (Unwatched):")
-        for show, episode, block in self.playlist:
+        for show, episode, block, *_ in self.playlist:
             print(f"Show: {show}, Episode: {episode}")
 
     def create_custom_schedule_mi(self):
@@ -502,53 +1216,50 @@ class CustomMediaPlayer(QWidget):
         specific_episode = "Rock"  # Replace with your desired episode filename
         self.playlist.append((selected_movie, specific_episode, "Miguzi Intro"))
 
-        duration = get_selection("How long would you like to watch Miguzi (hours)?", range(2, 4))
 
         # Step 1: Specify duration for Cartoon Network
-        if duration:
-            num_shows = duration * 2
-            cartoon_network_shows = self.get_shows_for_block("Miguzi")
 
-            for _ in range(num_shows):
-                if cartoon_network_shows:  # Ensure there are still shows left to choose
-                    show = random.choice(cartoon_network_shows)
-                    cartoon_network_shows.remove(show)  # Remove the selected show from the list
+        num_shows = 2 * 2
+        cartoon_network_shows = self.get_shows_for_block("Miguzi")
 
-                    episodes = self.get_next_unwatched_episode(show)
-                    if episodes:
-                        for episode in episodes:
-                            self.playlist.append((show, episode, "Miguzi"))
+        for _ in range(num_shows):
+            if cartoon_network_shows:  # Ensure there are still shows left to choose
+                show = random.choice(cartoon_network_shows)
+                cartoon_network_shows.remove(show)  # Remove the selected show from the list
+
+                episodes = self.get_next_unwatched_episode(show)
+                if episodes:
+                    for episode in episodes:
+                        self.playlist.append((show, episode, "Miguzi"))
 
         # Finalize the playlist
         self.finalize_playlist()
         print("Custom Schedule Created (Unwatched):")
-        for show, episode, block in self.playlist:
+        for show, episode, block, *_ in self.playlist:
             print(f"Show: {show}, Episode: {episode}")
 
     def create_custom_schedule_fox(self):
         self.is_random_block = True
         self.selected_block = "Fox"
-        duration = get_selection("How long would you like to watch Fox (hours)?", range(2, 5))
 
-        # Step 1: Specify duration for Cartoon Network
-        if duration:
-            num_shows = duration * 2
-            cartoon_network_shows = self.get_shows_for_block("Fox")
 
-            for _ in range(num_shows):
-                if cartoon_network_shows:  # Ensure there are still shows left to choose
-                    show = random.choice(cartoon_network_shows)
-                    cartoon_network_shows.remove(show)  # Remove the selected show from the list
+        num_shows = 4
+        cartoon_network_shows = self.get_shows_for_block("Fox")
 
-                    episodes = self.get_next_unwatched_episode(show)
-                    if episodes:
-                        for episode in episodes:
-                            self.playlist.append((show, episode, "Fox"))
+        for _ in range(num_shows):
+            if cartoon_network_shows:  # Ensure there are still shows left to choose
+                show = random.choice(cartoon_network_shows)
+                cartoon_network_shows.remove(show)  # Remove the selected show from the list
+
+                episodes = self.get_next_unwatched_episode(show)
+                if episodes:
+                    for episode in episodes:
+                        self.playlist.append((show, episode, "Fox"))
 
         # Finalize the playlist
         self.finalize_playlist()
         print("Custom Schedule Created (Unwatched):")
-        for show, episode, block in self.playlist:
+        for show, episode, block, *_ in self.playlist:
             print(f"Show: {show}, Episode: {episode}")
 
     def create_custom_schedule_as(self):
@@ -565,14 +1276,14 @@ class CustomMediaPlayer(QWidget):
         # Step 1: Specify duration for Cartoon Network
 
         num_shows = 3 * 2
-        episodes = self.get_next_unwatched_episode("Ghost in the Shell")
-        if episodes:
-            # only take the first unwatched episode
-            episode = episodes[0]
-            self.playlist.append(("Ghost in the Shell", episode, "Adult Swim"))
-            cartoon_network_shows.remove('Ghost in the Shell')
-        else:
-            print("[WARN] No unwatched episodes found for Ghost in the Shell")
+        # episodes = self.get_next_unwatched_episode("Inuyasha")
+        # if episodes:
+        #     # only take the first unwatched episode
+        #     episode = episodes[0]
+        #     self.playlist.append(("Inuyasha", episode, "Adult Swim"))
+        #     cartoon_network_shows.remove('Inuyasha')
+        # else:
+        #     print("[WARN] No unwatched episodes found for Ghost in the Shell")
 
         for _ in range(num_shows):
             if cartoon_network_shows:  # Ensure there are still shows left to choose
@@ -587,7 +1298,7 @@ class CustomMediaPlayer(QWidget):
         # Finalize the playlist
         self.finalize_playlist()
         print("Custom Schedule Created (Unwatched):")
-        for show, episode, block in self.playlist:
+        for show, episode, block, *_ in self.playlist:
             print(f"Show: {show}, Episode: {episode}")
 
     def create_custom_schedule_anime(self):
@@ -600,12 +1311,14 @@ class CustomMediaPlayer(QWidget):
 
         for _ in range(num_shows):
             # 10% chance to pick OVA for THIS slot only
-            if random.random() < 0.15 and ova_shows:
-                block = "OVA"
-                source = ova_shows
-            else:
-                block = "ANIME"
-                source = anime_shows
+            # if random.random() < 0.15 and ova_shows:
+            #     block = "OVA"
+            #     source = ova_shows
+            # else:
+            #     block = "ANIME"
+            #     source = anime_shows
+            block = "ANIME"
+            source = anime_shows
 
             if not source:
                 continue  # nothing left in this block
@@ -621,7 +1334,7 @@ class CustomMediaPlayer(QWidget):
         self.finalize_playlist()
 
         print("Custom Schedule Created (Unwatched):")
-        for show, episode, block in self.playlist:
+        for show, episode, block, *_ in self.playlist:
             print(f"Show: {show}, Episode: {episode}, Block: {block}")
 
     def create_custom_schedule_nn(self):
@@ -644,7 +1357,7 @@ class CustomMediaPlayer(QWidget):
         # Finalize the playlist
         self.finalize_playlist()
         print("Custom Schedule Created (Unwatched):")
-        for show, episode, block in self.playlist:
+        for show, episode, block, *_ in self.playlist:
             print(f"Show: {show}, Episode: {episode}")
 
     def create_custom_schedule_sves(self):
@@ -674,7 +1387,7 @@ class CustomMediaPlayer(QWidget):
         # Finalize the playlist
         self.finalize_playlist()
         print("Custom Schedule Created (Unwatched):")
-        for show, episode, block in self.playlist:
+        for show, episode, block, *_ in self.playlist:
             print(f"Show: {show}, Episode: {episode}")
 
     def create_custom_schedule_wb(self):
@@ -699,7 +1412,7 @@ class CustomMediaPlayer(QWidget):
         # Finalize the playlist
         self.finalize_playlist()
         print("Custom Schedule Created (Unwatched):")
-        for show, episode, block in self.playlist:
+        for show, episode, block, *_ in self.playlist:
             print(f"Show: {show}, Episode: {episode}")
 
     def create_custom_schedule_unwatched(self):
@@ -720,11 +1433,8 @@ class CustomMediaPlayer(QWidget):
             # Finalize the playlist
             self.finalize_playlist()
             print("Custom Schedule Created (Unwatched):")
-            for show, episode, block in self.playlist:
+            for show, episode, block, *_ in self.playlist:
                 print(f"Show: {show}, Episode: {episode}")
-
-
-
 
     def save_single_channel_ffmpeg_playlist(self, filename):
         """
@@ -734,11 +1444,29 @@ class CustomMediaPlayer(QWidget):
         playlist_path = os.path.join(os.getcwd(), filename)
         try:
             with open(playlist_path, "w", encoding="utf-8") as f:
-                for file_path in (getattr(self, "playlist_files", []) or []):
-                    if not file_path:
-                        continue
-                    abs_path = os.path.abspath(file_path.strip())
-                    f.write(f"{abs_path}\n")
+                # playlist_files is a dict: {(show, episode): [paths], ...}
+                # We need to iterate over the VALUES (lists of paths)
+                playlist_data = getattr(self, "playlist_files", {}) or {}
+
+                if isinstance(playlist_data, dict):
+                    # New format: dictionary with lists of paths
+                    for file_path_list in playlist_data.values():
+                        if isinstance(file_path_list, list):
+                            for file_path in file_path_list:
+                                if file_path:
+                                    abs_path = os.path.abspath(file_path.strip())
+                                    f.write(f"{abs_path}\n")
+                        elif file_path_list:
+                            # Single path (not a list)
+                            abs_path = os.path.abspath(file_path_list.strip())
+                            f.write(f"{abs_path}\n")
+                else:
+                    # Old format: list of paths
+                    for file_path in playlist_data:
+                        if file_path:
+                            abs_path = os.path.abspath(file_path.strip())
+                            f.write(f"{abs_path}\n")
+
             print(f":) FFmpeg playlist saved as {playlist_path}")
         except Exception as e:
             print(f"[save_single_channel_ffmpeg_playlist] Error saving playlist {playlist_path}: {e}")
@@ -772,15 +1500,14 @@ class CustomMediaPlayer(QWidget):
                 print("No valid music episode found.")
         # Finalize the playlist
         self.finalize_playlist()
-        # for show, episode, block in self.playlist:
-        #     print(f"Show: {show}, Episode: {episode}")
+        self.save_selected_shows(filename="selected_music.txt")  # ✅ ADD THIS
         self.save_single_channel_ffmpeg_playlist("Music.m3u")
 
     def save_selected_shows(self, filename="selected_shows.txt"):
         with open(filename, "w", encoding="utf-8") as f:
             last_show = None
 
-            for show, _, _ in self.playlist:
+            for show, *_ in self.playlist:
                 if show != last_show:
                     f.write(f"{show}\n")
                     last_show = show
@@ -843,6 +1570,7 @@ class CustomMediaPlayer(QWidget):
         if usable_slots < 0:
             usable_slots = 0
 
+        current += self.partial_spill * slot_len  # ← ADD THIS LINE: advance clock past the spill
         # spill is now consumed
         self.partial_spill = 0
         shows = self.get_shows_for_block(block_name)
@@ -856,26 +1584,29 @@ class CustomMediaPlayer(QWidget):
 
         schedule = []
         used_shows = set()
-        movie_blocks = {"Cartoon Theater", "Toonami Movie", "Disney Movie", "Toon Disney Movie", "Fox Movie", "Sci-Fi Movie", "Nick Movie", "ABC Movie"}
+        movie_blocks = {"Cartoon Theater", "Anime Movie", "Toonami Movie", "Disney Movie", "Toon Disney Movie", "Fox Movie", "Sci-Fi Movie", "Nick Movie", "ABC Movie"}
         preschool_blocks = {"Playhouse Disney", "Nick Jr"}
         short_shows = {
             "Frisky Dingo", "Space Ghost","Sealab 2021","Superjail!","Moral Orel",
             "Metalocalypse","China IL","The Brak Show","Harvey Birdman, Attorney At Law","Aqua Teen Hunger Force",
         }
         hour_shows = {"Smallville","Charmed","Dawsons Creek","Felicity","7th Heaven",
-"Gilmore Girls","MADtv","Andromeda","Farscape","Firefly","First Wave",
-"Stargate Atlantis","Stargate SG-1","The 4400","Dark Angel","X-Files","Kyle XY","House"}
+"Gilmore Girls","MADtv","Andromeda","Farscape","Firefly","First Wave", "Battlestar Galactica",
+"Stargate SG-1","The 4400","Dark Angel","X-Files","Kyle XY","House", "Stargate Atlantis","Dominion"}
 
         MOVIE_FILLERS = {
             "Disney Movie": "Brandy and Mr Whiskers",
             "Toon Disney Movie": "Brandy and Mr Whiskers",
             "Cartoon Theater": "What a Cartoon Show",
             "Toonami Movie": "What a Cartoon Show",
-            "Nick Movie": "Oh Yeah Cartoons"
+            "Nick Movie": "Oh Yeah Cartoons",
+            "Anime Movie": ["Tsuredure Children","Aho Girl", "Magical Sempai"],
         }
         remaining_shows = shows[:]  # pool without repeats
+        no_episode_shows = set()  # shows confirmed to have no episodes at all
 
-        with open(log_file, "a", encoding="utf-8") as log:
+        with open(log_file, "a", encoding="utf-8") as log, \
+                open("missing.log", "a", encoding="utf-8") as missing_log:
             log.write(f"\n=== Block {block_name} ({start_h}:00–{end_h}:00) ===\n")
 
             # --- Normal block handling ---
@@ -887,7 +1618,11 @@ class CustomMediaPlayer(QWidget):
                 # while current < end:
             # while (current - start_h * 3600) < allowed_slots * slot_len:
                 if not remaining_shows:
-                    break
+                    # Try to refill with shows that weren't used and aren't confirmed empty
+                    fallback_shows = [s for s in shows if s not in used_shows and s not in no_episode_shows]
+                    if not fallback_shows:
+                        break
+                    remaining_shows = fallback_shows
 
                 slot_start = str(datetime.timedelta(seconds=current))
                 slot_end = str(datetime.timedelta(seconds=current + slot_len))
@@ -897,9 +1632,18 @@ class CustomMediaPlayer(QWidget):
 
                 is_movie = block_name in movie_blocks and show in self.movie_slots
 
+                # If we're in a movie block but this show isn't a movie, skip it
+                if block_name in movie_blocks and not is_movie:
+                    msg = f"[{block_name}] {show} not in Movie Slots CSV, skipping\n"
+                    # print(msg.strip())
+                    log.write(msg)
+                    continue
+
                 if is_movie:
                     slots_raw = float(self.movie_slots[show])  # e.g. 2.5, 3.5
                     slots_consumed = math.ceil(slots_raw)  # 3, 4
+
+                    overflow = max(0, slots_consumed - block_slots)
 
                     eps = self.get_next_unwatched_episode(show, max_count=1)
                     if not eps:
@@ -909,22 +1653,29 @@ class CustomMediaPlayer(QWidget):
                     used_shows.add(show)
                     self.channel_first_runs.add(show)
 
-                    schedule.append((show, ep, block_name))
+                    schedule.append((show, ep, block_name, current))
 
                     log.write(
                         f"[{block_name}] MOVIE {show} uses {slots_raw} → {slots_consumed} slots\n"
                     )
+                    # print(f"[{block_name}] MOVIE {show} uses {slots_raw} → {slots_consumed} slots")
 
                     # how many slots this block can hold
                     block_slots = int((end_h - start_h) * 2)
-
-                    # spill into NEXT block
-                    self.partial_spill = max(0, slots_consumed - block_slots)
+                    if block_name == "ABC Movie":
+                        self.movie_overrun_slots += overflow
+                        self.partial_spill = 0  # do not affect the next ABC movie block
+                    else:
+                        # spill into NEXT block
+                        self.partial_spill = max(0, slots_consumed - block_slots)
 
                     # cosmetic filler ONLY (does NOT affect math)
                     if slots_raw % 1 != 0 and block_name in MOVIE_FILLERS and block_name != "Nick Movie":
 
                         filler_show = MOVIE_FILLERS[block_name]
+
+                        if isinstance(filler_show, list):
+                            filler_show = random.choice(filler_show)
 
                         if filler_show == "What a Cartoon Show":
                             eps_sets = self.get_random_episode(
@@ -947,9 +1698,11 @@ class CustomMediaPlayer(QWidget):
                 if block_name == "House":
                     eps_sets = self.get_next_unwatched_episode(show, max_count=4)
                     if not eps_sets:
-                        msg = f"[{block_name}] No episodes for {show}, skipping slot {slot_start}-{slot_end}\n"
-                        print(msg.strip());
+                        msg = f"[{block_name}] No episodes for {show}, skipping\n"
+                        # print(msg.strip());
                         log.write(msg)
+                        missing_log.write(msg)
+                        no_episode_shows.add(show)
                         slots_used += 1
                         continue
 
@@ -957,12 +1710,12 @@ class CustomMediaPlayer(QWidget):
                     self.channel_first_runs.add(show)
 
                     for ep in eps_sets:
-                        schedule.append((show, ep, block_name))
+                        schedule.append((show, ep, block_name, current))
                         msg = f"[{block_name}] SPECIAL (House 1h) Slot {slot_start}-{slot_end}: {show} {ep}\n"
-                        print(msg.strip());
+                        # print(msg.strip());
                         log.write(msg)
-                        # advance by 2 slots (1 hour)
-                        current += slot_len * 2
+                        slots_used += 2  # 1 hour = 2 slots
+                        current += slot_len * 2  # ← ONLY this line, remove the "+ slot_len" you added
                         slot_start = str(datetime.timedelta(seconds=current))
                         slot_end = str(datetime.timedelta(seconds=current + slot_len))
                     continue
@@ -972,8 +1725,10 @@ class CustomMediaPlayer(QWidget):
                     eps_sets = self.get_next_unwatched_episode(show, max_count=6)
                     if not eps_sets:
                         msg = f"[{block_name}] No episodes for {show}, skipping slot {slot_start}-{slot_end}\n"
-                        print(msg.strip());
+                        # print(msg.strip());
                         log.write(msg)
+                        missing_log.write(msg)
+                        no_episode_shows.add(show)
                         slots_used += 1
                         continue
 
@@ -981,11 +1736,12 @@ class CustomMediaPlayer(QWidget):
                     self.channel_first_runs.add(show)
 
                     for ep in eps_sets:
-                        schedule.append((show, ep, block_name))
+                        schedule.append((show, ep, block_name, current))
                         msg = f"[{block_name}] SPECIAL (Whose Line) Slot {slot_start}-{slot_end}: {show} {ep}\n"
-                        print(msg.strip());
+                        # print(msg.strip());
                         log.write(msg)
                         slots_used += 1
+                        current += slot_len  # ← add this
                         slot_start = str(datetime.timedelta(seconds=current))
                         slot_end = str(datetime.timedelta(seconds=current + slot_len))
                     continue
@@ -995,8 +1751,10 @@ class CustomMediaPlayer(QWidget):
                     eps_sets = self.get_random_episode(show, count=3, unwatched_only=True)
                     if not eps_sets:
                         msg = f"[{block_name}] No episodes for {show}, skipping slot {slot_start}-{slot_end}\n"
-                        print(msg.strip());
+                        # print(msg.strip());
                         log.write(msg)
+                        missing_log.write(msg)
+                        no_episode_shows.add(show)
                         slots_used += 1
                         continue
 
@@ -1005,45 +1763,58 @@ class CustomMediaPlayer(QWidget):
 
                     flat_eps = [ep for group in eps_sets for ep in group]
                     for ep in flat_eps:
-                        schedule.append((show, ep, block_name))
+                        schedule.append((show, ep, block_name, current))
                         msg = f"[{block_name}] SPECIAL Slot {slot_start}-{slot_end}: {show} {ep}\n"
-                        print(msg.strip());
+                        # print(msg.strip());
                         log.write(msg)
 
                     slots_used += 1
+                    current += slot_len  # ← add this
+                    slot_start = str(datetime.timedelta(seconds=current))
+                    slot_end = str(datetime.timedelta(seconds=current + slot_len))
                     continue
 
                 # --- Special case: Brandy and Mr Whiskers ---
-                if show in ["Brandy and Mr Whiskers",'theweek3nders']:
+                if show in ["Brandy and Mr Whiskers", 'theweek3nders']:
                     eps_sets = self.get_next_unwatched_episode(show, max_count=2)
                     if not eps_sets:
                         msg = f"[{block_name}] No episodes for {show}, skipping slot {slot_start}-{slot_end}\n"
-                        print(msg.strip());
+                        # print(msg.strip());
                         log.write(msg)
+                        missing_log.write(msg)
+                        no_episode_shows.add(show)
                         slots_used += 1
-                        continue
+                        continue  # ← outer loop continue (no episodes)
 
                     used_shows.add(show)
                     self.channel_first_runs.add(show)
 
-                    for ep in eps_sets:
-                        schedule.append((show, ep, block_name))
+                    for ep in eps_sets:  # just append — no clock movement here
+                        schedule.append((show, ep, block_name, current))
                         msg = f"[{block_name}] SPECIAL (brandy) Slot {slot_start}-{slot_end}: {show} {ep}\n"
-                        print(msg.strip());
+                        # print(msg.strip());
                         log.write(msg)
-                        slots_used += 1
-                        slot_start = str(datetime.timedelta(seconds=current))
-                        slot_end = str(datetime.timedelta(seconds=current + slot_len))
-                    continue
+
+                    # Advance ONCE after BOTH 15-min episodes fill the 30-min slot
+                    slots_used += 1
+                    current += slot_len
+                    slot_start = str(datetime.timedelta(seconds=current))
+                    slot_end = str(datetime.timedelta(seconds=current + slot_len))
+                    continue  # ← outer loop continue
 
                 # --- Special case: Bob the bulder ---
-                if show == 'Bob the Builder':
+                if show == 'Bob the Builder' or show == 'Stanleys':
                     eps_sets = self.get_random_episode(show, count=2, unwatched_only=True)
                     if not eps_sets:
                         msg = f"[{block_name}] No episodes for {show}, skipping slot {slot_start}-{slot_end}\n"
-                        print(msg.strip());
+                        # print(msg.strip());
                         log.write(msg)
+                        missing_log.write(msg)
+                        no_episode_shows.add(show)
                         slots_used += 1
+                        current += slot_len  # ← add this
+                        slot_start = str(datetime.timedelta(seconds=current))
+                        slot_end = str(datetime.timedelta(seconds=current + slot_len))
                         continue
 
                     used_shows.add(show)
@@ -1051,39 +1822,33 @@ class CustomMediaPlayer(QWidget):
 
                     flat_eps = [ep for group in eps_sets for ep in group]
                     for ep in flat_eps:
-                        schedule.append((show, ep, block_name))
+                        schedule.append((show, ep, block_name, current))
                         msg = f"[{block_name}] SPECIAL Slot {slot_start}-{slot_end}: {show} {ep}\n"
                         print(msg.strip());
                         log.write(msg)
 
                     slots_used += 1
+                    current += slot_len  # ← add this
+                    slot_start = str(datetime.timedelta(seconds=current))
+                    slot_end = str(datetime.timedelta(seconds=current + slot_len))
                     continue
 
-                # --- Special case: Infomercial (fill entire block with random "Info" clips) ---
-                if block_name == "Infomercial":
-                    pool = set()  # optional, avoids repeating the exact same file in this block
-                    while current < end:
-                        slot_start = str(datetime.timedelta(seconds=current))
-                        slot_end = str(datetime.timedelta(seconds=current + slot_len))
+                # --- Check if this is an hour-long show FIRST ---
+                is_hour_long = show in hour_shows
+                slots_needed = 2 if is_hour_long else 1
 
-                        ep_name = self.get_random_music("Info")  # ✅ reuse your music randomizer
-                        if not ep_name:
-                            msg = f"[{block_name}] ⚠️ No Infomercial clips found.\n"
-                            print(msg.strip())
-                            log.write(msg)
-                            slots_used += 1
-                            continue
-
-                        if ep_name in pool:  # skip duplicates inside same block
-                            continue
-                        pool.add(ep_name)
-
-                        schedule.append(("Info", ep_name, "Infomercial"))
-                        # msg = f"[{block_name}] INFO Slot {slot_start}-{slot_end}: Infomercial {ep_name}\n"
-                        # print(msg.strip())
-                        # log.write(msg)
-
-                        slots_used += 1
+                # Skip if not enough slots remaining
+                if slots_used + slots_needed > usable_slots:
+                    msg = f"[{block_name}] Not enough slots for {show} (needs {slots_needed}, only {usable_slots - slots_used} left)\n"
+                    # print(msg.strip())
+                    log.write(msg)
+                    slots_left = usable_slots - slots_used
+                    # If nothing left in the pool could possibly fit, stop now
+                    candidates = remaining_shows if remaining_shows else [
+                        s for s in shows if s not in used_shows and s not in no_episode_shows
+                    ]
+                    if not any((2 if s in hour_shows else 1) <= slots_left for s in candidates):
+                        break
                     continue
 
                 # --- Normal first-run vs rerun handling ---
@@ -1105,9 +1870,8 @@ class CustomMediaPlayer(QWidget):
 
                 if not eps:
                     msg = f"[{block_name}] No episodes for {show}, skipping slot {slot_start}-{slot_end}\n"
-                    print(msg.strip());
+                    # print(msg.strip());
                     log.write(msg)
-                    slots_used += 1
                     continue
 
                 used_shows.add(show)
@@ -1132,44 +1896,65 @@ class CustomMediaPlayer(QWidget):
                         used_shows.add(second_show)
 
                         for ep in eps:
-                            schedule.append((show, ep, block_name))
+                            schedule.append((show, ep, block_name, current))
                             msg = f"[{block_name}] {run_type} (15m) Slot {slot_start}-{slot_end}: {show} {ep}\n"
-                            print(msg.strip());
+                            # print(msg.strip());
                             log.write(msg)
                         for ep in eps2:
                             schedule.append((second_show, ep, block_name))
                             msg = f"[{block_name}] {run_type2} (15m pair) Slot {slot_start}-{slot_end}: {second_show} {ep}\n"
-                            print(msg.strip());
+                            # print(msg.strip());
                             log.write(msg)
 
                         slots_used += 1
+                        current += slot_len  # ← add this
+                        slot_start = str(datetime.timedelta(seconds=current))
+                        slot_end = str(datetime.timedelta(seconds=current + slot_len))
                         continue
 
-                # --- Normal 30-min shows ---
+                # --- Normal shows (30-min or 1-hour) ---
+                duration_label = "1h" if is_hour_long else "30m"
+                slot_start_sec = current  # snapshot time BEFORE advancing
+
+                # Deduplicate eps while preserving order — safe for both str and list items
+                seen = set()
+                deduped = []
                 for ep in eps:
-                    if isinstance(ep, list):  # 🔥 unwrap nested lists
+                    key = tuple(ep) if isinstance(ep, list) else ep
+                    if key not in seen:
+                        seen.add(key)
+                        deduped.append(ep)
+                eps = deduped
+
+                for ep in eps:
+                    if isinstance(ep, list):
                         for sub_ep in ep:
-                            schedule.append((show, sub_ep, block_name))
-                            msg = f"[{block_name}] {run_type} Slot {slot_start}-{slot_end}: {show} {sub_ep}\n"
-                            print(msg.strip())
+                            schedule.append((show, sub_ep, block_name, slot_start_sec))  # ← add slot_start_sec
+                            msg = f"[{block_name}] {run_type} ({duration_label}) Slot {slot_start}-{slot_end}: {show} {sub_ep}\n"
+                            # print(msg.strip())
                             log.write(msg)
                     else:
-                        schedule.append((show, ep, block_name))
-                        msg = f"[{block_name}] {run_type} Slot {slot_start}-{slot_end}: {show} {ep}\n"
-                        print(msg.strip())
+                        schedule.append((show, ep, block_name, slot_start_sec))  # ← add slot_start_sec
+                        msg = f"[{block_name}] {run_type} ({duration_label}) Slot {slot_start}-{slot_end}: {show} {ep}\n"
+                        # print(msg.strip())
                         log.write(msg)
 
-                slots_used += 1
+                slots_used += slots_needed
+                current += slot_len * slots_needed  # ← THIS IS THE MISSING LINE — advances the clock
+
+                # update slot_start/slot_end strings for next loop iteration
+                slot_start = str(datetime.timedelta(seconds=current))
+                slot_end = str(datetime.timedelta(seconds=current + slot_len))
 
             # debug summary
-            missing = set(shows) - used_shows
-            if missing:
-                msg = f"[DEBUG] Block {block_name}: {len(missing)} shows never added: {sorted(missing)}\n"
-                print(msg.strip());
-                log.write(msg)
-            msg = f"[DEBUG] Block {block_name}: picked {len(used_shows)} / {len(shows)} shows\n"
-            print(msg.strip());
-            log.write(msg)
+            # missing = set(shows) - used_shows
+            # if missing:
+            #     msg = f"[DEBUG] Block {block_name}: {len(missing)} shows never added: {sorted(missing)}\n"
+            #     print(msg.strip());
+            #     log.write(msg)
+            # msg = f"[DEBUG] Block {block_name}: picked {len(used_shows)} / {len(shows)} shows\n"
+            # print(msg.strip());
+            # log.write(msg)
 
         return schedule
 
@@ -1182,12 +1967,23 @@ class CustomMediaPlayer(QWidget):
         self.channel_first_runs = set()  # ✅ reset at the start of this channel
         day = datetime.datetime.today().weekday()  # 0=Mon .. 6=Sun
 
-        if day:
-            self.playlist.extend(self.build_grid_for_block("ANIME", 7, 23))
+        # Run ANIME block every day (0=Mon through 6=Sun)
+        anime_sche = random.randint(1,2)
+        if anime_sche == 1:
+            self.playlist.extend(self.build_grid_for_block("Anime Movie", 7, 8))
+            self.playlist.extend(self.build_grid_for_block("ANIME", 8, 21))
+            self.playlist.extend(self.build_grid_for_block("Anime Movie", 21, 22))
+        else:
+            self.playlist.extend(self.build_grid_for_block("ANIME", 7, 12))
+            self.playlist.extend(self.build_grid_for_block("Anime Movie", 12,13 ))
+            self.playlist.extend(self.build_grid_for_block("ANIME", 13, 15))
+            self.playlist.extend(self.build_grid_for_block("Anime Movie", 15, 16))
+            self.playlist.extend(self.build_grid_for_block("ANIME", 16, 23))
 
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_anime.txt")
         self.save_single_channel_ffmpeg_playlist("Anime.m3u")
+        return self.playlist
 
     def create_kodi_phh(self):
         import datetime, random
@@ -1197,6 +1993,7 @@ class CustomMediaPlayer(QWidget):
         self.channel_first_runs = set()  # ✅ reset at the start of this channel
         day = datetime.datetime.today().weekday()  # 0=Mon .. 6=Sun
         end1 = random.choice([17, 18])
+        self.sves_on_p = False
 
         if day < 4:
             self.playlist.extend(self.build_grid_for_block("PowerHour", 7, 15))
@@ -1221,6 +2018,7 @@ class CustomMediaPlayer(QWidget):
                 self.playlist.extend(self.build_grid_for_block("PowerHour", 7, 17))
                 self.playlist.extend(self.build_grid_for_block("Cartoon Theater", 17, 18))
                 self.playlist.extend(self.build_grid_for_block("SVES", 18, 23))
+                self.sves_on_p = True
 
         elif day == 6:  # Sunday
             self.playlist.extend(self.build_grid_for_block("PowerHour", 7, 10))
@@ -1232,6 +2030,7 @@ class CustomMediaPlayer(QWidget):
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_phh.txt")
         self.save_single_channel_ffmpeg_playlist("Powerhouse.m3u")
+        return self.playlist
 
     def create_kodi_toonamii(self):
         import datetime, random
@@ -1240,19 +2039,19 @@ class CustomMediaPlayer(QWidget):
         self.playlist = []
         self.channel_first_runs = set()  # ✅ reset at the start of this channel
         day = datetime.datetime.today().weekday()  # 0=Mon .. 6=Sun
+        self.sves_on = False
 
 
         # if day == 1:
-        if day == 2:
-        # if day == 0:
+        # if day == 2:
+        if day == 0:
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 7, 10))
             self.playlist.extend(self.build_grid_for_block("Cartoon Theater", 10, 11))
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 11, 15))
             self.playlist.extend(self.build_grid_for_block("Toonami", 15, 17))
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 17, 19))
             self.playlist.extend(self.build_grid_for_block("Adult Swim", 19, 23))
-        elif 0 < day:
-        # elif 0 < day < 4:
+        elif 0 < day < 4:
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 7, 15))
             self.playlist.extend(self.build_grid_for_block("Toonami", 15, 17))
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 17, 19))
@@ -1260,7 +2059,8 @@ class CustomMediaPlayer(QWidget):
         elif day == 4:
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 7, 16))
             self.playlist.extend(self.build_grid_for_block("Toonami", 16, 17))
-            self.playlist.extend(self.build_grid_for_block("Toonami Movie", 17, 19))
+            self.playlist.extend(self.build_grid_for_block("Toonami Movie", 17, 18))
+            self.playlist.extend(self.build_grid_for_block("Toonami", 18, 19))
             self.playlist.extend(self.build_grid_for_block("Adult Swim", 19, 23))
 
         elif day == 5:  # Saturday
@@ -1269,6 +2069,7 @@ class CustomMediaPlayer(QWidget):
                 self.playlist.extend(self.build_grid_for_block("Cartoon Network", 7, 16))
                 self.playlist.extend(self.build_grid_for_block("Cartoon Theater", 16, 18))
                 self.playlist.extend(self.build_grid_for_block("SVES", 18, 23))
+                self.sves_on = True
             else:
                 self.playlist.extend(self.build_grid_for_block("Cartoon Network", 7, 16))
                 self.playlist.extend(self.build_grid_for_block("Toonami Movie", 16, 17))
@@ -1284,6 +2085,7 @@ class CustomMediaPlayer(QWidget):
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_toonami.txt")
         self.save_single_channel_ffmpeg_playlist("Toonami.m3u")
+        return self.playlist
 
     def create_kodi_miguzii(self):
         import datetime, random
@@ -1300,7 +2102,6 @@ class CustomMediaPlayer(QWidget):
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 17, 19))
             self.playlist.extend(self.build_grid_for_block("Adult Swim", 19, 23))
 
-        # elif day == 4:
         elif day == 4:
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 7, 15))
             self.playlist.extend(self.build_grid_for_block("Toonami", 15, 18))
@@ -1324,13 +2125,14 @@ class CustomMediaPlayer(QWidget):
         elif day == 6:  # Sunday
             self.playlist.extend(self.build_grid_for_block("Cartoon Network", 7, 10))
             self.playlist.extend(self.build_grid_for_block("Cartoon Theater", 10, 11))
-            self.playlist.extend(self.build_grid_for_block("Cartoon Network", 12, 19))
+            self.playlist.extend(self.build_grid_for_block("Cartoon Network", 11, 19))
             self.playlist.extend(self.build_grid_for_block("Adult Swim", 19, 23))
 
         # finalize + save
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_miguzi.txt")
         self.save_single_channel_ffmpeg_playlist("Miguzi.m3u")
+        return self.playlist
 
     def create_kodi_nickk(self):
         import datetime, random
@@ -1363,6 +2165,7 @@ class CustomMediaPlayer(QWidget):
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_nick.txt")
         self.save_single_channel_ffmpeg_playlist("Nick.m3u")
+        return self.playlist
 
     def create_kodi_disneyy(self):
         import datetime, random
@@ -1372,7 +2175,7 @@ class CustomMediaPlayer(QWidget):
         self.channel_first_runs = set()  # ✅ reset at the start of this channel
         day = datetime.datetime.today().weekday()  # 0=Mon .. 6=Sun
 
-        if day in range(4):
+        if day in range(5):
             self.playlist.extend(self.build_grid_for_block("Toon Disney", 7, 9))
             self.playlist.extend(self.build_grid_for_block("Playhouse Disney", 9, 12))
             self.playlist.extend(self.build_grid_for_block("Disney", 12, 20))
@@ -1389,6 +2192,7 @@ class CustomMediaPlayer(QWidget):
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_disney.txt")
         self.save_single_channel_ffmpeg_playlist("Disney.m3u")
+        return self.playlist
 
     def create_kodi_toondisneyy(self):
         import datetime, random
@@ -1412,9 +2216,9 @@ class CustomMediaPlayer(QWidget):
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_td.txt")
         self.save_single_channel_ffmpeg_playlist("ToonDisney.m3u")
+        return self.playlist
 
     def create_kodi_wbb(self):
-        print("[DEBUG] ENTER WB")
 
         import datetime, random
         self.partial_spill = 0
@@ -1424,31 +2228,26 @@ class CustomMediaPlayer(QWidget):
         self.channel_first_runs = set()  # ✅ reset at the start of this channel
         day = datetime.datetime.today().weekday()  # 0=Mon .. 6=Sun
 
-        if day < 5:
-            # self.playlist.extend(self.build_grid_for_block("Infomercial", 7, 12))
+        if day != 5:
+            self.playlist.extend(self.build_grid_for_block("WB Day", 7, 12))
             self.playlist.extend(self.build_grid_for_block("Xena", 12, 13))
             self.playlist.extend(self.build_grid_for_block("WB Day", 13, 15))
             self.playlist.extend(self.build_grid_for_block("Kids WB", 15, 17))
             self.playlist.extend(self.build_grid_for_block("WB Day", 17, 18))
             self.playlist.extend(self.build_grid_for_block("WB Prime", 18, 23))
 
-        elif day == 5:
+        else:
             self.playlist.extend(self.build_grid_for_block("Kids WB", 7, 12))
             self.playlist.extend(self.build_grid_for_block("Xena", 12, 13))
             self.playlist.extend(self.build_grid_for_block("WB Day", 13, 16))
-            self.playlist.extend(self.build_grid_for_block("WB Prime", 16, 20))
-            # self.playlist.extend(self.build_grid_for_block("Infomercial", 20, 23))
+            self.playlist.extend(self.build_grid_for_block("WB Prime", 16, 22))
 
-        else: # Saturday
-            # self.playlist.extend(self.build_grid_for_block("Infomercial", 7, 14))
-            self.playlist.extend(self.build_grid_for_block("Xena", 14, 15))
-            self.playlist.extend(self.build_grid_for_block("WB Day", 15, 18))
-            self.playlist.extend(self.build_grid_for_block("WB Prime", 18, 23))
 
         # finalize + save
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_WB.txt")
         self.save_single_channel_ffmpeg_playlist("WB.m3u")
+        return self.playlist
 
     def create_kodi_foxx(self):
         import datetime, random
@@ -1458,15 +2257,14 @@ class CustomMediaPlayer(QWidget):
         self.channel_first_runs = set()  # ✅ reset at the start of this channel
         day = datetime.datetime.today().weekday()  # 0=Mon .. 6=Sun
 
-        if day > 4:
+        if day < 4:
             self.playlist.extend(self.build_grid_for_block("Fox", 7, 11))
-            # self.playlist.extend(self.build_grid_for_block("Infomercial", 11, 14))
+            self.playlist.extend(self.build_grid_for_block("Fox Prime", 16, 19))
             self.playlist.extend(self.build_grid_for_block("House", 14, 18))
             self.playlist.extend(self.build_grid_for_block("Fox Prime", 18, 23))
-        # elif day == 4:
-        elif day == 2:
+        elif day == 4:
             self.playlist.extend(self.build_grid_for_block("Fox", 7, 11))
-            # self.playlist.extend(self.build_grid_for_block("Infomercial", 11, 14))
+            self.playlist.extend(self.build_grid_for_block("Fox Prime", 16, 19))
             self.playlist.extend(self.build_grid_for_block("Fox Movie", 14, 16))
             self.playlist.extend(self.build_grid_for_block("Fox Prime", 16, 19))
             self.playlist.extend(self.build_grid_for_block("House", 19, 23))
@@ -1483,6 +2281,7 @@ class CustomMediaPlayer(QWidget):
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_fox.txt")
         self.save_single_channel_ffmpeg_playlist("Fox.m3u")
+        return self.playlist
 
     def create_kodi_abcc(self):
         import datetime, random
@@ -1509,20 +2308,21 @@ class CustomMediaPlayer(QWidget):
             self.playlist.extend(self.build_grid_for_block("Whos Line", 20, 23))
 
         else:
+
             self.playlist.extend(self.build_grid_for_block("ABC Jetix", 7, 11))
             self.playlist.extend(self.build_grid_for_block("ABC Prime", 11, 12))
             self.playlist.extend(self.build_grid_for_block("ABC", 12, 14))
             self.playlist.extend(self.build_grid_for_block("ABC Movie", 14, 15))
             self.playlist.extend(self.build_grid_for_block("ABC Movie", 16, 17))
             self.playlist.extend(self.build_grid_for_block("ABC Movie", 18, 19))
-            self.playlist.extend(self.build_grid_for_block("ABC Prime", 20, 22))
-            self.playlist.extend(self.build_grid_for_block("Whos Line", 22, 23))
+            self.playlist.extend(self.build_grid_for_block("ABC Prime", 21, 23))
+
 
         # finalize + save
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_abc.txt")
         self.save_single_channel_ffmpeg_playlist("ABC.m3u")
-        print("[DEBUG] ABC returning normally")
+        return self.playlist
 
     def create_kodi_scifii(self):
         import datetime, random
@@ -1532,24 +2332,19 @@ class CustomMediaPlayer(QWidget):
         self.channel_first_runs = set()  # ✅ reset at the start of this channel
         day = datetime.datetime.today().weekday()  # 0=Mon .. 6=Sun
 
-        if day < 5:
-            # self.playlist.extend(self.build_grid_for_block("Infomercial", 7, 10))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi Anime", 10, 14))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi Movie", 14, 15))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi Anime", 15, 17))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi", 17, 23))
-        else:
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi", 7, 10))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi Movie", 10, 12))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi Anime", 12, 15))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi Movie", 15, 17))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi Anime", 17, 18))
-            self.playlist.extend(self.build_grid_for_block("Sci-Fi", 18, 23))
+
+        self.playlist.extend(self.build_grid_for_block("Sci-Fi", 7, 10))
+        self.playlist.extend(self.build_grid_for_block("Sci-Fi Movie", 10, 12))
+        self.playlist.extend(self.build_grid_for_block("Sci-Fi Anime", 12, 15))
+        self.playlist.extend(self.build_grid_for_block("Sci-Fi Movie", 15, 17))
+        self.playlist.extend(self.build_grid_for_block("Sci-Fi Anime", 17, 18))
+        self.playlist.extend(self.build_grid_for_block("Sci-Fi", 18, 23))
 
         # finalize + save
         self.finalize_playlist()
         self.save_selected_shows(filename="selected_sci-fi.txt")
         self.save_single_channel_ffmpeg_playlist("SciFi.m3u")
+        return self.playlist
 
     def create_kodi_schedule(self):
         import datetime, time, random
@@ -1558,31 +2353,40 @@ class CustomMediaPlayer(QWidget):
         day_start = now.replace(hour=7, minute=0, second=0, microsecond=0)
         if now < day_start:
             day_start -= datetime.timedelta(days=1)
+        current_time = int((now - day_start).total_seconds())
 
-        # seconds since 07:00 today
-        current_time = int((now - day_start).total_seconds())  # ← keep the old name
+        self.channel_playlists = {}
 
-        self.channel_playlists = {
-            "Anime": self.create_kodi_anime(),
-            "PowerHour": self.create_kodi_phh(),
-            "Miguzi": self.create_kodi_miguzii(),
-            "Toonami": self.create_kodi_toonamii(),
-            "Disney": self.create_kodi_disneyy(),
-            "Toon Disney": self.create_kodi_toondisneyy(),
-            "Fox": self.create_kodi_foxx(),
-            "ABC": self.create_kodi_abcc(),
-            # "The WB": self.create_kodi_wbb(),
-            "Nick": self.create_kodi_nickk(),
-            "Sci-Fi": self.create_kodi_scifii(),
-            "Music": self.create_kodi_music(current_time),
-        }
+        self.create_kodi_anime();
+        self.channel_playlists["Anime"] = list(self._raw_schedule)
+        self.create_kodi_phh();
+        self.channel_playlists["PowerHour"] = list(self._raw_schedule)
+        self.create_kodi_miguzii();
+        self.channel_playlists["Miguzi"] = list(self._raw_schedule)
+        self.create_kodi_toonamii();
+        self.channel_playlists["Toonami"] = list(self._raw_schedule)
+        self.create_kodi_disneyy();
+        self.channel_playlists["Disney"] = list(self._raw_schedule)
+        self.create_kodi_toondisneyy();
+        self.channel_playlists["Toon Disney"] = list(self._raw_schedule)
+        self.create_kodi_foxx();
+        self.channel_playlists["Fox"] = list(self._raw_schedule)
+        self.create_kodi_abcc();
+        self.channel_playlists["ABC"] = list(self._raw_schedule)
+        self.create_kodi_wbb();
+        self.channel_playlists["The WB"] = list(self._raw_schedule)
+        self.create_kodi_nickk();
+        self.channel_playlists["Nick"] = list(self._raw_schedule)
+        self.create_kodi_scifii();
+        self.channel_playlists["Sci-Fi"] = list(self._raw_schedule)
+        self.create_kodi_music(current_time);
+        # self.channel_playlists["Music"] = list(self._raw_schedule)
 
-        # seed elapsed‑time tracking
+        # seed elapsed-time tracking
         self.channel_elapsed_time = {ch: current_time for ch in self.channel_playlists}
         self.global_elapsed_time = current_time
         self.channel_start_time = time.time()
 
-        #jump into the first channel
         first = "PowerHour"
         self.current_channel_index = self.channel_list.index(first)
         print(f"Live TV starting at real clock {now:%H:%M}, offset "
@@ -1596,49 +2400,49 @@ class CustomMediaPlayer(QWidget):
         day_start = now.replace(hour=7, minute=0, second=0, microsecond=0)
         if now < day_start:
             day_start -= datetime.timedelta(days=1)
+        current_time = int((now - day_start).total_seconds())
 
-        # seconds since 07:00 today
-        current_time = int((now - day_start).total_seconds())  # ← keep the old name
+        self.channel_playlists = {}
 
-        self.channel_playlists = {
+        self.create_kodi_foxx();
+        self.channel_playlists["Fox"] = list(self._raw_schedule)
+        self.create_kodi_wbb();
+        self.channel_playlists["The WB"] = list(self._raw_schedule)
+        self.create_kodi_toondisneyy();
+        self.channel_playlists["Toon Disney"] = list(self._raw_schedule)
+        self.create_kodi_music(current_time);
+        self.create_kodi_phh();
+        self.channel_playlists["PowerHour"] = list(self._raw_schedule)
+        self.create_kodi_abcc();
+        self.channel_playlists["ABC"] = list(self._raw_schedule)
+        self.create_kodi_nickk();
+        self.channel_playlists["Nick"] = list(self._raw_schedule)
+        self.create_kodi_miguzii();
+        self.channel_playlists["Miguzi"] = list(self._raw_schedule)
+        self.create_kodi_toonamii();
+        self.channel_playlists["Toonami"] = list(self._raw_schedule)
+        self.create_kodi_disneyy();
+        self.channel_playlists["Disney"] = list(self._raw_schedule)
+        self.create_kodi_scifii();
+        self.channel_playlists["Sci-Fi"] = list(self._raw_schedule)
+        self.create_kodi_anime();
+        self.channel_playlists["Anime"] = list(self._raw_schedule)
 
-            "PowerHour": self.create_kodi_phh(),
-            "Miguzi": self.create_kodi_miguzii(),
+        # ✅ SAVE PLAYLISTS TO DISK
+        import json
+        try:
+            with open("guide_data.json", "w") as f:
+                json.dump(self.channel_playlists, f)
+            print("[Guide] Saved schedule to disk")
+        except Exception as e:
+            print(f"[Guide] Error saving: {e}")
+        # self.channel_playlists["Music"] = list(self._raw_schedule)
 
-            "Toonami": self.create_kodi_toonamii(),
-            "Disney": self.create_kodi_disneyy(),
-            "Toon Disney": self.create_kodi_toondisneyy(),
-            "Fox": self.create_kodi_foxx(),
-            "ABC": self.create_kodi_abcc(),
-            # "The WB": self.create_kodi_wbb(),
-            "Nick": self.create_kodi_nickk(),
-            "Anime": self.create_kodi_anime(),
-            "Sci-Fi": self.create_kodi_scifii(),
-            "Music": self.create_kodi_music(current_time),
-
-            # "Fox": self.create_kodi_fox(current_time),
-            # "The WB": self.create_kodi_wb(current_time),
-            # "PowerHour": self.create_kodi_ph(current_time),
-            # "ABC": self.create_kodi_abc(current_time),
-            # "Nick": self.create_kodi_nick(current_time),
-            # "Miguzi": self.create_kodi_miguzi(current_time),
-            # "Toonami": self.create_kodi_toonami(current_time),
-            # "Disney": self.create_kodi_dis(current_time),
-            # "Toon Disney": self.create_kodi_toondisney(current_time),
-            # "Sci-Fi": self.create_kodi_scifi(current_time),
-        }
-
-        # seed elapsed‑time tracking
+        # seed elapsed-time tracking
         self.channel_elapsed_time = {ch: current_time for ch in self.channel_playlists}
         self.global_elapsed_time = current_time
         self.channel_start_time = time.time()
 
-        # jump into the first channel
-        # first = "PowerHour"
-        # self.current_channel_index = self.channel_list.index(first)
-        # print(f"Live TV starting at real clock {now:%H:%M}, offset "
-        #       f"{current_time // 3600}h{(current_time % 3600) // 60:02d}m.")
-        # self.switch_channel(first, force_reset=True)
 
     def parse_m3u(self, playlist_file):
         """Reads the M3U file, extracts full paths, and retrieves durations from loaded media data."""
@@ -1657,7 +2461,7 @@ class CustomMediaPlayer(QWidget):
                     full_path = os.path.abspath(line)  # Convert to absolute path
                     videos.append(full_path)
 
-                    # 🔍 Get duration from `file_path_durations`
+                    # 🔍 Get duration from file_path_durations
                     video_duration = self.file_path_durations.get(full_path, 0)
                     durations.append(video_duration)
 
@@ -2010,6 +2814,7 @@ class CustomMediaPlayer(QWidget):
             "--no-border",
             "--force-window=yes",
             "--no-shuffle",
+            "--input-ipc-server=/tmp/mpv-socket",  # ← ADD
             f"--start={int(start_offset)}",
             first,
             *rest
@@ -2023,6 +2828,7 @@ class CustomMediaPlayer(QWidget):
             "--fs",
             "--no-border",
             "--force-window=yes",
+            "--input-ipc-server=/tmp/mpv-socket",  # ← ADD
             f"--start={int(offset)}",
             video,
         ]
@@ -2067,7 +2873,23 @@ class CustomMediaPlayer(QWidget):
         return 0, 0
 
     def switch_channel(self, new_channel, force_reset=False):
-        # kill any existing mpv
+        self.current_channel = new_channel  # ← MOVE THIS HERE (line 1)
+
+        subprocess.run(["pkill", "-f", "mpv"],
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+
+        if self.guide_window is not None:
+            self.guide_window.stop()
+            self.guide_window = None
+
+        if self.channels.get(new_channel) == "__guide__":
+            playlists = getattr(self, "channel_playlists", {})
+            self.guide_window = TVGuideChannel(playlists, self.channels, player=self)
+            self.guide_window.showFullScreen()
+            return
+
+            # kill any existing mpv
         subprocess.run(["pkill", "-f", "mpv"],
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
@@ -2099,20 +2921,15 @@ class CustomMediaPlayer(QWidget):
             if self.current_channel != new_channel:
                 return
 
-            cmd = [
-                "mpv",
-                "--fs",
-                "--no-border",
-                "--force-window=yes",
-                "--no-shuffle",
-                "--loop-playlist=inf",
-                *rest
-            ]
-
+            cmd = ["mpv", "--fs", "--no-border", "--force-window=yes",
+                   "--no-shuffle", "--loop-playlist=inf",
+                   "--input-ipc-server=/tmp/mpv-socket", *rest]
             proc = subprocess.Popen(cmd)
 
             def watcher():
                 time.sleep(0.5)
+                if self.current_channel != new_channel:  # ← ADD THIS GUARD
+                    return
                 self.show_overlay_for_channel(new_channel, mode="continue")
 
             threading.Thread(target=watcher, daemon=True).start()
@@ -2161,15 +2978,28 @@ class CustomMediaPlayer(QWidget):
                     image = "empty"
 
         elif channel_name == 'Toonami':
-            if current_hour >= 19 and not self.sves_on:
-                image = 'adultswim1'
+            if weekday in ["Saturday"]:
+                if current_hour >= 16:
+                    if self.sves_on:
+                        image = 'sves'
+                    else:
+                        image = random.choice(['ph1', 'ph2', 'ph3', 'powerhour'])
+                else:
+                    image = 'cn1'
             else:
-                image = random.choice(['cn1', 'cn2'])
+
+                if current_hour >= 19:
+                    image = 'adultswim1'
+                else:
+                    image = 'cn1'
 
         elif channel_name == 'PowerHour':
             if current_hour >= 19:
-                if weekday in ["Saturday", "Friday"]:
-                    image = random.choice(['ph1', 'ph2', 'ph3', 'powerhour'])
+                if weekday in ["Saturday"]:
+                    if self.sves_on_p:
+                        image = 'sves'
+                    else:
+                        image = random.choice(['ph1', 'ph2', 'ph3', 'powerhour'])
                 else:
                     image = 'adultswim1'
             else:
@@ -2190,11 +3020,11 @@ class CustomMediaPlayer(QWidget):
                 image = "miguzi"
             elif current_hour >= 19:
                 if weekday in ["Saturday", "Friday"]:
-                    image = random.choice(['cn1', 'cn2'])
+                    image = 'cn1'
                 else:
                     image = 'adultswim1'
             else:
-                image = random.choice(['cn1', 'cn2'])
+                image = 'cn1'
 
         elif channel_name == 'Nickelodeon':
             if weekday in ["Saturday", "Sunday"]:
@@ -2220,12 +3050,12 @@ class CustomMediaPlayer(QWidget):
         elif channel_name == 'THE WB':
             if weekday == "Saturday":
                 if current_hour <= 11:
-                    image = random.choice(['kidswb', 'kidswb2', 'kidswb3', 'kidswb4', 'kidswb5'])
+                    image = random.choice(['kidswb', 'kidswb2', 'kidswb3'])
                 else:
                     image = random.choice(['wb', 'wb2', 'wb3', 'wb4'])
             elif weekday != "Sunday":
                 if 16 <= current_hour <= 17:
-                    image = random.choice(['kidswb', 'kidswb2', 'kidswb3', 'kidswb4', 'kidswb5'])
+                    image = random.choice(['kidswb', 'kidswb2', 'kidswb3'])
                 else:
                     image = random.choice(['wb', 'wb2', 'wb3', 'wb4'])
             else:
@@ -2236,6 +3066,11 @@ class CustomMediaPlayer(QWidget):
 
         elif channel_name == 'Sci-Fi':
             image = "scifi"
+
+        elif channel_name == 'Anime':
+            image = random.choice(['anime', 'anime3', 'animax', 'anime5'])
+        # elif channel_name == 'Anime':
+        #     image = "b"
 
         else:
             image = "default"
@@ -2313,6 +3148,11 @@ class CustomMediaPlayer(QWidget):
         try:
             self.kill_existing_overlays()
             time.sleep(0.05)
+            # Convert to absolute path from the media root
+            if not os.path.isabs(image_path):
+                # Get the parent directory of Player (which is /media/weazle/media/)
+                media_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                image_path = os.path.join(media_root, image_path)
 
             cmd = [
                 "pqiv",
@@ -2428,25 +3268,44 @@ class CustomMediaPlayer(QWidget):
         self.current_channel_index = (self.current_channel_index - 1) % len(self.channel_list)
         self.switch_channel(self.channel_list[self.current_channel_index])
 
+    def send_mpv_key(self, key):
+        """Send a keypress to mpv via IPC — no window focus needed."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect("/tmp/mpv-socket")
+                cmd = json.dumps({"command": ["keypress", key]}) + "\n"
+                s.sendall(cmd.encode())
+        except Exception as e:
+            print(f"[mpv IPC] Could not send key '{key}': {e}")
+
     def handle_key_event(self):
         for event in self.keyboard_device.read():
-            if event.type == ecodes.EV_KEY and event.value == 1:  # Key press event
+            if event.type == ecodes.EV_KEY and event.value == 1:  # key down
                 if event.code == ecodes.KEY_PAGEDOWN:
                     self.previous_channel()
                 elif event.code == ecodes.KEY_PAGEUP:
                     self.next_channel()
                 elif event.code == ecodes.KEY_C:
-                    subprocess.run([
-                        "xdotool", "search", "--name", "VLC media player", "key", "c"
-                    ])
+                    self.send_mpv_key("c")  # no focus stolen
                 elif event.code == ecodes.KEY_A:
-                    subprocess.run([
-                        "xdotool", "search", "--name", "VLC media player", "key", "a"
-                    ])
+                    self.send_mpv_key("A")  # capital A — no focus stolen
+                elif event.code == ecodes.KEY_J:
+                    self.send_mpv_key("j")  # subtitle cycle
+                elif event.code == ecodes.KEY_W:
+                    self.send_mpv_key("W")  # Pan in cycle
+                elif event.code == ecodes.KEY_Q:
+                    self.send_mpv_key("w")  # Pan out cycle
+                # Fn+D → # : replace 999 with the real code once you find it
+                elif event.code == ecodes.KEY_D:
+                    self.send_mpv_key("#")
+                else:
+                    # TEMP: print unknown keys so you can find the Fn+D code
+                    pass
+                    # print(f"[evdev] unhandled key code: {event.code}  ({ecodes.KEY.get(event.code, '?')})")
 
     def get_random_episode(self, show, count=1, unwatched_only=False):
         """
-        Retrieve `count` random episodes for a given show from 'Episodes.csv'.
+        Retrieve count random episodes for a given show from 'Episodes.csv'.
         - If unwatched_only=True, only pick episodes with Played='no'.
         - Each returned item may itself be a list (split episodes A/B/C).
         Always returns a list of lists (outer list = count, inner list = episode parts).
@@ -2480,35 +3339,48 @@ class CustomMediaPlayer(QWidget):
 
     def get_rerun_episode(self, show, max_count=1):
         """
-        Retrieve up to `max_count` rerun episodes (Played != 'no') for a given show.
-        - Splits on '/' so multi-part episodes are grouped.
-        - Always returns a list (possibly empty).
-        - If max_count=1 and the episode has slashes, expands them all.
+        Retrieve up to max_count random rerun episodes.
+        Only selects rows where Played == 'yee'.
+        Returns a flat list of episode strings.
         """
+        import random, csv
+
         try:
             episodes = []
+
             with open('Episodes.csv', newline='', encoding='utf-8-sig') as csvfile:
                 reader = csv.DictReader(csvfile)
-                for row in reader:
-                    if row['Show'] == show and row['Played'].strip().lower() != 'no':
-                        ep_field = (row.get('Episode') or "").strip()
-                        if ep_field:
-                            split_eps = [ep.strip() for ep in ep_field.split(' / ') if ep.strip()]
-                            if max_count == 1:
-                                return split_eps  # expand full multi-part if single slot
-                            else:
-                                episodes.append(split_eps)
-                    if len(episodes) >= max_count:
-                        break
 
-            # flatten and cap at max_count
-            return [ep for group in episodes for ep in group][:max_count] or []
+                for row in reader:
+                    if row['Show'] != show:
+                        continue
+
+                    if row['Played'].strip().lower() != "yee":
+                        continue
+
+                    ep_field = (row.get('Episode') or "").strip()
+                    if ep_field:
+                        split_eps = [ep.strip() for ep in ep_field.split(" / ") if ep.strip()]
+                        episodes.append(split_eps)
+
+            if not episodes:
+                print(f"No rerun episodes (Played='yee') found for {show}.")
+                return []
+
+            chosen_sets = random.sample(episodes, k=min(max_count, len(episodes)))
+
+            # 🔥 FLATTEN HERE — this is the key fix
+            flat = []
+            for group in chosen_sets:
+                flat.extend(group)
+
+            return flat
 
         except FileNotFoundError:
-            print("⚠️ Episodes.csv not found.")
+            print("Episodes.csv not found.")
             return []
         except Exception as e:
-            print(f"⚠️ Error reading Episodes.csv: {e}")
+            print(f"Error reading Episodes.csv: {e}")
             return []
 
     def get_random_music(self, show):
@@ -2534,7 +3406,7 @@ class CustomMediaPlayer(QWidget):
 
     def get_next_unwatched_episode(self, show, max_count=1):
         """
-        Retrieve up to `max_count` next unwatched episodes for a given show from 'Episodes.csv'.
+        Retrieve up to max_count next unwatched episodes for a given show from 'Episodes.csv'.
         If an episode contains '/', it's split and expanded accordingly.
         """
         try:
@@ -2554,7 +3426,7 @@ class CustomMediaPlayer(QWidget):
                         if len(episodes) >= max_count:
                             break
 
-            # Flatten and return up to `max_count` episode parts
+            # Flatten and return up to max_count episode parts
             return [ep for group in episodes for ep in group][:max_count] or None
 
         except Exception as e:
@@ -2617,7 +3489,7 @@ class CustomMediaPlayer(QWidget):
 
         # --- Preprocess: split episodes with slashes ---
         split_playlist = []
-        for show, episode_str, block in self.playlist:
+        for show, episode_str, block, *_ in self.playlist:
             episode_str = episode_str.strip()  # Clean overall string
             if "/" in episode_str:
                 episodes = [e.strip() for e in episode_str.split("/") if e.strip()]
@@ -2627,17 +3499,33 @@ class CustomMediaPlayer(QWidget):
                 split_playlist.append((show.strip(), episode_str, block.strip()))
 
         self.playlist = split_playlist
-        for index, (show, episode, block) in enumerate(self.playlist):
+        for index, (show, episode, block, *_) in enumerate(self.playlist):
             channel_block = block
             self.current_show, self.current_episode, self.current_block = show, episode, channel_block
 
-            # Get all parts of the current episode
-            current_parts = [key for key in self.playlist_files if key[0] == show and key[1].startswith(episode)]
+            # ✅ NORMALIZE before lookup (same as match_schedule_with_media does)
+            normalized_show = self.normalize_show_name(show)
+            normalized_episode = self.normalize_episode_name(episode)
+
+            # Get all parts of the current episode using normalized keys
+            current_parts = [key for key in self.playlist_files if
+                             key[0] == normalized_show and key[1].startswith(normalized_episode)]
             current_parts.sort(key=lambda x: x[1])  # Ensure correct part order
+
+            # If no parts found, log and skip
+            if not current_parts:
+                msg = f"[WARN] Episode not found in playlist_files: {show} - {episode}\n"
+                print(msg.strip())
+                try:
+                    with open("gap_warnings.log", "a") as logf:
+                        logf.write(msg)
+                except Exception:
+                    pass
+                continue
 
             # Determine next show/block
             if index + 1 < len(self.playlist):
-                self.next_show, self.next_episode, self.next_block = self.playlist[index + 1]
+                self.next_show, self.next_episode, self.next_block, *_ = self.playlist[index + 1]
             else:
                 self.next_show, self.next_episode, self.next_block = None, None, None
 
@@ -2645,15 +3533,27 @@ class CustomMediaPlayer(QWidget):
             ep_key = f"{show} - {episode}".strip()
             total_gap = self.gap_durations.get(ep_key, 0)
 
-            if total_gap == 0:
-                total_gap = 160  # ✅ default gap
-                warning = f"[WARN] Using default gap=160 for Show={show}, Episode={episode}"
-                print(warning)
-                try:
+            content = 0
+            for part_key in current_parts:
+                for fp in self.playlist_files.get(part_key, []) or []:
+                    content += self.file_path_durations.get(os.path.abspath(fp), 0)
+
+            if content >= 900:
+                hint = total_gap if total_gap > 0 else 160
+                target = round((content + hint) / 1800) * 1800
+                if target <= content + 30:
+                    target = math.ceil((content + 30) / 1800) * 1800
+                snapped = target - content
+                if snapped > target * 0.45:
+                    snapped = total_gap or 160
+                if total_gap and abs(snapped - total_gap) > 60:
+                    msg = f"[GAP-SNAP] {ep_key}: CSV said {total_gap}s, grid needs {snapped}s"
+                    print(msg)
                     with open("gap_warnings.log", "a") as logf:
-                        logf.write(warning + "\n")
-                except Exception:
-                    pass
+                        logf.write(msg + "\n")
+                total_gap = snapped
+            elif total_gap == 0:
+                total_gap = 160
 
             # Divide total gap across parts
             num_parts = len(current_parts)
@@ -2676,10 +3576,13 @@ class CustomMediaPlayer(QWidget):
                     self.next_show = self.next_episode = self.next_block = None
 
                 # add commercials
+
+                is_first_break_of_episode = (part_index == 0)
+
                 part_commercials = commercial_scheduler.get_commercials_for_show(
                     channel_block,
                     gap_per_part,
-                    index == 0 and part_index == 0,
+                    part_index == 0,
                     current_show=part_show,
                     current_episode=part_episode,
                     current_block=channel_block,
@@ -2729,8 +3632,10 @@ class CustomMediaPlayer(QWidget):
             return result
 
         # ✅ Load both files into one dictionary
-        gaps.update(load_file("episodes_with_gaps.csv"))
+        # gaps.update(load_file("episodes_with_gaps.csv"))
+
         gaps.update(load_file("episodes_with_gaps_split.csv"))
+        gaps.update(load_file("episodes_with_gaps.csv"))
 
         return gaps
 
@@ -2872,7 +3777,7 @@ class CustomMediaPlayer(QWidget):
                 media_files.setdefault((normalized_show, episode_base_name), []).append(row['File Path'])
 
         playlist_files = {}
-        for show, episode, block in schedule:  # Unpack block as well
+        for show, episode, block, *_ in schedule:  # Unpack block as well
             normalized_show = self.normalize_show_name(show)
             normalized_episode = self.normalize_episode_name(episode)
 
@@ -2897,6 +3802,7 @@ class CustomMediaPlayer(QWidget):
         return playlist_files
 
     def finalize_playlist(self):
+        self._raw_schedule = list(self.playlist)  # ← ADD THIS — snapshot before transforms
         self.save_selected_shows()
 
         # Use self.playlist directly
@@ -2991,6 +3897,7 @@ class CustomMediaPlayer(QWidget):
                 "--fs",
                 "--no-border",
                 "--geometry=100%x100%",
+                "--input-ipc-server=/tmp/mpv-socket",  # ← ADD
                 video_path
             ])
         except Exception as e:
